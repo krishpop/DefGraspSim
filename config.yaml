@@ -1,7 +1,7 @@
 
 
-use_viewer: False
-replace_existing_results: False
+use_viewer: True
+replace_existing_results: True
 write_results: True
 
 sim_params:

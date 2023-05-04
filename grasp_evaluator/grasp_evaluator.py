@@ -33,19 +33,25 @@ from utils import pandafsm
 from utils import uniform_sphere
 from utils import metrics_features_utils
 
+ACRONYM_ASSET_DIR = f"/juno/u/tylerlum/github_repos/nerf_grasping/assets"
+ACRONYM_DATA_DIR = f"/juno/u/tylerlum/github_repos/acronym/data/grasps"
 
 class GraspEvaluator:
     """Simulate selected object, grasp, material params, and evaluation mode."""
 
     def __init__(self, object_name, grasp_ind, oris, density,
-                 youngs, poissons, friction, mode, tag=''):
+                 youngs, poissons, friction, mode, tag='', is_acronym=False):
         """Initialize parameters for simulation for the specific grasp and material properties."""
         with open("config.yaml") as yamlfile:
             self.cfg = yaml.safe_load(yamlfile)
 
 
         # Soft object material parameters
-        self.object_name = object_name.lower()
+        self.is_acronym = is_acronym
+        if is_acronym:
+            self.object_name = object_name
+        else:
+            self.object_name = object_name.lower()
         self.grasp_ind = grasp_ind
         self.oris = oris  # Array of [ori_start, ori_end]
         self.density = density
@@ -56,13 +62,20 @@ class GraspEvaluator:
 
         # Directories of assets and results
         self.assets_dir = os.path.abspath(self.cfg['dir']['assets_dir'])
+
         self.franka_urdf = os.path.abspath(self.cfg['dir']['franka_urdf'])
         self.results_dir = os.path.abspath(self.cfg['dir']['results_dir'])
-        self.object_path = os.path.join(self.assets_dir, self.object_name)
+        if is_acronym:
+            self.get_grasp_candidates_acronym()
+            obj_name = '_'.join(self.object_name.split('_')[:-1])
+            self.object_scale = float(self.object_name.split('_')[-1])
+            self.object_path = os.path.join(ACRONYM_ASSET_DIR, "objects", "urdf",  obj_name + ".urdf")
+        else:
+            self.object_path = os.path.join(self.assets_dir, self.object_name)
+            self.get_grasp_candidates()
         self.tag = tag
 
         # Load candidate grasp and initialize results folder
-        self.get_grasp_candidates()
         self.data_exists = self.init_results_folder()
         if not self.cfg['replace_existing_results'] and self.data_exists:
             return
@@ -127,6 +140,23 @@ class GraspEvaluator:
                 print("Existing data is imperfect, rerunning")
         return False
 
+    def get_grasp_candidates_acronym(self):
+        """Load the candidate grasp of interest."""
+        from scipy.spatial.transform import Rotation as R
+        acronym_data_filepath = os.path.join(ACRONYM_DATA_DIR, self.object_name + ".h5")
+        f = h5py.File(acronym_data_filepath, "r")
+        grasps = np.array(f["grasps/transforms"])
+        print("loaded acronym grasp candidates", grasps.shape)
+        candidate_grasp = grasps[self.grasp_ind]
+        q = R.from_matrix(candidate_grasp[:3, :3]).as_quat()
+        p = candidate_grasp[:3, 3]
+        # compose candidate grasp, xyz-pos, xyzw-quat
+        self.grasp_candidate_poses = np.concatenate([p, q]).reshape(1, -1)
+        self.num_grasp_poses = grasps.shape[0]
+        print("Number of total grasp candidates", self.num_grasp_poses)
+        f.close()
+
+
     def get_grasp_candidates(self):
         """Load the candidate grasp of interest."""
         grasp_file_name = self.object_name + "_grasps.h5"
@@ -137,6 +167,54 @@ class GraspEvaluator:
         f.close()
 
     def create_sim(self):
+        return self._create_sim_flex()
+
+    def setup_sim(self, gym):
+        # only tested with this one
+        sim_type = gymapi.SIM_PHYSX
+
+        # configure sim
+        sim_params = gymapi.SimParams()
+        sim_params.dt = 1.0 / 60.0
+
+        sim_params.up_axis = gymapi.UP_AXIS_Z
+        sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.8)
+
+        sim_params.physx.solver_type = 1
+        sim_params.physx.num_position_iterations = 6
+        sim_params.physx.num_velocity_iterations = 0
+        sim_params.physx.num_threads = args.num_threads
+        sim_params.physx.use_gpu = args.use_gpu
+        # sim_params.physx.use_gpu = True
+
+        # sim_params.use_gpu_pipeline = True
+        sim_params.use_gpu_pipeline = False
+
+        gpu_physics = 0 
+        gpu_render = 0
+        if not self.cfg['use_viewer']:
+            gpu_render = -1
+
+        sim = self.gym.create_sim(
+            gpu_physics,
+            gpu_render,
+            sim_type,
+            sim_params,
+        )
+        assert sim is not None, f"{__file__}.setup_sim() failed"
+
+        intensity = 0.5
+        ambient = 0.10 / intensity
+        intensity = gymapi.Vec3(intensity, intensity, intensity)
+        ambient = gymapi.Vec3(ambient, ambient, ambient)
+
+        gym.set_light_parameters(sim, 0, intensity, ambient, gymapi.Vec3(0.5, 1, 1))
+        gym.set_light_parameters(sim, 1, intensity, ambient, gymapi.Vec3(1, 0, 1))
+        gym.set_light_parameters(sim, 2, intensity, ambient, gymapi.Vec3(0.5, -1, 1))
+        gym.set_light_parameters(sim, 3, intensity, ambient, gymapi.Vec3(0, 0, 1))
+        return sim
+
+    def _create_sim_flex(self):
         """Set sim parameters and create a Sim object."""
         # Set simulation parameters
         sim_type = gymapi.SIM_FLEX
@@ -213,10 +291,13 @@ class GraspEvaluator:
 
         # Load Franka and object assets
         asset_file_platform = os.path.join(self.assets_dir, 'platform.urdf')
-        asset_file_object = os.path.join(self.object_path, "soft_body.urdf")
+        if self.is_acronym:
+            asset_file_object = self.object_path
+        else:
+            asset_file_object = os.path.join(self.object_path, "soft_body.urdf")
 
         # Set object parameters for object material properties
-        set_parameter_result = False
+        set_parameter_result = True
         fail_counter = 0
         while set_parameter_result is False and fail_counter < 10:
             try:
@@ -234,7 +315,7 @@ class GraspEvaluator:
         self.asset_handle_franka = self.gym.load_asset(self.sim, asset_root, self.franka_urdf,
                                                        asset_options)
 
-        asset_options.fix_base_link = False
+        asset_options.fix_base_link = True
         asset_options.min_particle_mass = 1e-20
         self.asset_handle_object = self.gym.load_asset(self.sim, asset_root, asset_file_object,
                                                        asset_options)
@@ -281,6 +362,37 @@ class GraspEvaluator:
                 zs.append(float(sp[3]))
         return 2 * abs(min(zs))
 
+    @staticmethod
+    def _get_mesh_path_from_urdf(urdf_path):
+        import xml.etree.ElementTree as ET
+
+        # Load the URDF file
+        tree = ET.parse(urdf_path)
+        root = tree.getroot()
+
+        # Find the mesh filename inside the URDF file
+        mesh_path = root.find(".//geometry/mesh").get("filename")
+        mesh_path = '/'.join(mesh_path.split("/")[1:])
+        return mesh_path
+
+    def get_height_of_trimesh_objects(self):
+        """Return the height of the soft object."""
+        import trimesh
+        # basename = os.path.basename(self.object_path)
+        # obj_path = os.path.splitext(basename)[0]
+        # obj_name, commit = obj_path.split('_')
+        asset_path = self.object_path
+        mesh_path = os.path.join(ACRONYM_ASSET_DIR, "objects", "meshes", self._get_mesh_path_from_urdf(asset_path))
+
+        mesh = trimesh.load(mesh_path, force="mesh")
+        # scale object by trimesh scale transform
+        scale_transform = trimesh.transformations.scale_matrix(self.object_scale)
+        mesh.apply_transform(scale_transform)
+        (_, _, min_z), _ = mesh.bounds
+        return 2 * abs(min_z)
+
+
+
     def setup_scene(self):
         """Create environments, Franka actor, and object actor."""
         self.env_handles = []
@@ -300,6 +412,8 @@ class GraspEvaluator:
                     [self.all_directions[i][1], self.all_directions[i][2],
                      self.all_directions[i][0]])  # Read direction as y-up convention
             else:
+                # test_grasp_pose = np.array([0.,0.,0., 0.,0.,0.,1.], dtype="float32")
+                test_grasp_pose = self.grasp_candidate_poses[0]
                 direction = np.array(
                     [self.all_directions[0][1], self.all_directions[0][2],
                      self.all_directions[0][0]])  # Read direction as y-up convention
@@ -310,6 +424,7 @@ class GraspEvaluator:
             self.env_handles.append(env_handle)
 
             # Define shared pose/collision parameters
+            __import__('ipdb').set_trace()
             pose = gymapi.Transform()
             grasp_transform = gymapi.Transform()
             grasp_transform.r = gymapi.Quat(test_grasp_pose[4], test_grasp_pose[5],
@@ -325,9 +440,12 @@ class GraspEvaluator:
                                  test_grasp_pose[2])
             pose.p = self.neg_rot_x_transform.transform_vector(pose.p)
             pose.p.y += self.cfg['sim_params']['platform_height']
+            print("franka handle initial pose", np.array(pose.p))
             franka_handle = self.gym.create_actor(env_handle, self.asset_handle_franka, pose,
                                                   f"franka_{i}", collision_group, 1)
             self.franka_handles.append(franka_handle)
+
+            __import__('ipdb').set_trace()
 
             curr_joint_positions = self.gym.get_actor_dof_states(
                 env_handle, franka_handle, gymapi.STATE_ALL)
@@ -363,8 +481,12 @@ class GraspEvaluator:
                                           curr_joint_positions, gymapi.STATE_ALL)
 
             # Create soft object
-            tet_file_name = os.path.join(self.object_path, self.object_name + ".tet")
-            height_of_object = self.get_height_of_objects(tet_file_name)
+            if self.is_acronym:
+                height_of_object = self.get_height_of_trimesh_objects()
+            else:
+                tet_file_name = os.path.join(self.object_path, self.object_name + ".tet")
+                height_of_object = self.get_height_of_objects(tet_file_name)
+
             pose = gymapi.Transform()
             pose.r = self.neg_rot_x_transform.r
 
@@ -409,6 +531,7 @@ class GraspEvaluator:
                 directions = self.all_directions[i:i + 1]
 
             else:
+                test_grasp_pose = np.array([0.,0.,0., 1.,0.,0.,0.], dtype="float32")
                 test_grasp_pose = self.env_spread[i]
 
             pure_grasp_transform = gymapi.Transform()
@@ -443,6 +566,7 @@ class GraspEvaluator:
 
         all_done = False
         loop_start = timeit.default_timer()
+        __import__('ipdb').set_trace()
 
         while not all_done:
 
@@ -459,6 +583,12 @@ class GraspEvaluator:
                         panda_fsms[i].timed_out = True
 
             for i in range(len(self.env_handles)):
+                left_finger_transform = self.gym.get_rigid_transform(
+                                        panda_fsms[i].env_handle, panda_fsms[i].left_finger_handle)
+                fingertip_pos = np.array([left_finger_transform.p.x,
+                                                   left_finger_transform.p.y,
+                                                   left_finger_transform.p.z])
+                print('left finger position', fingertip_pos)
                 panda_fsms[i].update_previous_particle_state_tensor()
 
             all_done = all(panda_fsms[i].state == 'done'
