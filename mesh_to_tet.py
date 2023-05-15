@@ -58,5 +58,5 @@ def convert_mesh_to_tet(mesh_file_path, tet_output_path):
 
 if __name__ == "__main__":
     convert_mesh_to_tet(
-        "path/to/mesh",
-        "path/to/tet")
+            "./examples/vase/vase.mesh",
+        "./examples/vase/vase.tet")

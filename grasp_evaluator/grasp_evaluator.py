@@ -72,7 +72,15 @@ class GraspEvaluator:
             self.object_path = os.path.join(ACRONYM_ASSET_DIR, "objects", "urdf",  obj_name + ".urdf")
         else:
             self.object_path = os.path.join(self.assets_dir, self.object_name)
-            self.get_grasp_candidates()
+            if self.object_name == "test":
+                obj_name = "Donut_615d0b4bbec771e99a6e43b878d5b335_0.0179108154069622"
+                self.get_grasp_candidates_acronym(f"{obj_name}.h5")
+                self.object_scale = float(obj_name.split('_')[-1])
+                obj_name = '_'.join(obj_name.split('_')[:-1])
+                self.object_path = os.path.join(ACRONYM_ASSET_DIR, "objects", "urdf",  obj_name + ".urdf")
+                self.is_acronym =True
+            else:
+                self.get_grasp_candidates()
         self.tag = tag
 
         # Load candidate grasp and initialize results folder
@@ -140,10 +148,13 @@ class GraspEvaluator:
                 print("Existing data is imperfect, rerunning")
         return False
 
-    def get_grasp_candidates_acronym(self):
+    def get_grasp_candidates_acronym(self, filepath=None):
         """Load the candidate grasp of interest."""
         from scipy.spatial.transform import Rotation as R
-        acronym_data_filepath = os.path.join(ACRONYM_DATA_DIR, self.object_name + ".h5")
+        if filepath is not None:
+            acronym_data_filepath  =os.path.join(ACRONYM_DATA_DIR, filepath)
+        else:
+            acronym_data_filepath = os.path.join(ACRONYM_DATA_DIR, self.object_name + ".h5")
         f = h5py.File(acronym_data_filepath, "r")
         grasps = np.array(f["grasps/transforms"])
         print("loaded acronym grasp candidates", grasps.shape)
@@ -169,22 +180,23 @@ class GraspEvaluator:
     def create_sim(self):
         return self._create_sim_flex()
 
-    def setup_sim(self, gym):
+    def _create_sim_physx(self, gym):
         # only tested with this one
         sim_type = gymapi.SIM_PHYSX
 
         # configure sim
         sim_params = gymapi.SimParams()
-        sim_params.dt = 1.0 / 60.0
+        # sim_params.dt = 1.0 / 60.0
+        sim_params.dt = 1.0 / 1500
 
-        sim_params.up_axis = gymapi.UP_AXIS_Z
-        sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.8)
+        # sim_params.up_axis = gymapi.UP_AXIS_Z
+        sim_params.gravity = gymapi.Vec3(0.0, -9.8, 0.0)
 
         sim_params.physx.solver_type = 1
         sim_params.physx.num_position_iterations = 6
         sim_params.physx.num_velocity_iterations = 0
-        sim_params.physx.num_threads = args.num_threads
-        sim_params.physx.use_gpu = args.use_gpu
+        sim_params.physx.num_threads = self.cfg.num_threads
+        sim_params.physx.use_gpu = self.cfg.use_gpu
         # sim_params.physx.use_gpu = True
 
         # sim_params.use_gpu_pipeline = True
@@ -195,24 +207,12 @@ class GraspEvaluator:
         if not self.cfg['use_viewer']:
             gpu_render = -1
 
-        sim = self.gym.create_sim(
+        return self.gym.create_sim(
             gpu_physics,
             gpu_render,
             sim_type,
             sim_params,
         )
-        assert sim is not None, f"{__file__}.setup_sim() failed"
-
-        intensity = 0.5
-        ambient = 0.10 / intensity
-        intensity = gymapi.Vec3(intensity, intensity, intensity)
-        ambient = gymapi.Vec3(ambient, ambient, ambient)
-
-        gym.set_light_parameters(sim, 0, intensity, ambient, gymapi.Vec3(0.5, 1, 1))
-        gym.set_light_parameters(sim, 1, intensity, ambient, gymapi.Vec3(1, 0, 1))
-        gym.set_light_parameters(sim, 2, intensity, ambient, gymapi.Vec3(0.5, -1, 1))
-        gym.set_light_parameters(sim, 3, intensity, ambient, gymapi.Vec3(0, 0, 1))
-        return sim
 
     def _create_sim_flex(self):
         """Set sim parameters and create a Sim object."""
@@ -424,7 +424,6 @@ class GraspEvaluator:
             self.env_handles.append(env_handle)
 
             # Define shared pose/collision parameters
-            __import__('ipdb').set_trace()
             pose = gymapi.Transform()
             grasp_transform = gymapi.Transform()
             grasp_transform.r = gymapi.Quat(test_grasp_pose[4], test_grasp_pose[5],
@@ -445,7 +444,6 @@ class GraspEvaluator:
                                                   f"franka_{i}", collision_group, 1)
             self.franka_handles.append(franka_handle)
 
-            __import__('ipdb').set_trace()
 
             curr_joint_positions = self.gym.get_actor_dof_states(
                 env_handle, franka_handle, gymapi.STATE_ALL)
@@ -566,7 +564,6 @@ class GraspEvaluator:
 
         all_done = False
         loop_start = timeit.default_timer()
-        __import__('ipdb').set_trace()
 
         while not all_done:
 
