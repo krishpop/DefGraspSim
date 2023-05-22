@@ -30,7 +30,7 @@ def main():
     """Visualize tet in mesh_path."""
     # mesh_path = os.path.join('assets', 'small_mat_taller', 'small_mat_taller.stl.tet')
     # mesh_path = os.path.join('assets', 'mug', 'mug_tet.tet')
-    mesh_path = os.path.join('assets', 'donut', 'donut_tet.tet')
+    mesh_path = os.path.join('assets', 'dog', 'dog.tet')
 
     verts, tets = import_tet(path=mesh_path)
     tris = tets_to_tris(tets=tets)

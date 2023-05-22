@@ -34,7 +34,7 @@ DEBUG = False
 class PandaFsm:
     """FSM for control of Panda hand for the grasp tests."""
 
-    def __init__(self, cfg, gym_handle, sim_handle, env_handles, franka_handle,
+    def __init__(self, cfg, controller_cfg, gym_handle, sim_handle, env_handles, franka_handle,
                  platform_handle, object_cof,
                  grasp_transform, obj_name, env_id, hand_origin, viewer,
                  envs_per_row, env_dim, youngs, density, directions, mode):
@@ -63,6 +63,7 @@ class PandaFsm:
         self.started = False
         self.state = 'open'
         self.cfg = cfg
+        self.controller_cfg = controller_cfg
 
         # Simulation handles
         self.gym_handle = gym_handle
@@ -149,7 +150,7 @@ class PandaFsm:
         self.hand_origin = hand_origin
         self.mid_finger_origin = np.array([
             self.hand_origin.p.x, self.hand_origin.p.y,
-            self.hand_origin.p.z + self.cfg['franka']['gripper_tip_z_offset'], 1
+            self.hand_origin.p.z + self.cfg['gripper_tip_z_offset'], 1
         ])
         self.mid_finger_position_transformed = np.zeros(3)
         self.left_finger_position_origin = np.array([
@@ -157,20 +158,20 @@ class PandaFsm:
             self.hand_origin.p.z, 1
         ])
         self.left_finger_position = np.array([
-            self.hand_origin.p.x, self.hand_origin.p.y + self.cfg['franka']['gripper_tip_y_offset'],
-            self.hand_origin.p.z + self.cfg['franka']['gripper_tip_z_offset'], 1
+            self.hand_origin.p.x, self.hand_origin.p.y + self.cfg['gripper_tip_y_offset'],
+            self.hand_origin.p.z + self.cfg['gripper_tip_z_offset'], 1
         ])
         self.right_finger_position_origin = np.array([
             self.hand_origin.p.x, self.hand_origin.p.y,
             self.hand_origin.p.z, 1
         ])
         self.right_finger_position = np.array([
-            self.hand_origin.p.x, self.hand_origin.p.y - self.cfg['franka']['gripper_tip_y_offset'],
-            self.hand_origin.p.z + self.cfg['franka']['gripper_tip_z_offset'], 1
+            self.hand_origin.p.x, self.hand_origin.p.y - self.cfg['gripper_tip_y_offset'],
+            self.hand_origin.p.z + self.cfg['gripper_tip_z_offset'], 1
         ])
         self.mid_finger_position = np.array([
             self.hand_origin.p.x, self.hand_origin.p.y,
-            self.hand_origin.p.z + self.cfg['franka']['gripper_tip_z_offset'], 1
+            self.hand_origin.p.z + self.cfg['gripper_tip_z_offset'], 1
         ])
         self.left_normal = self.grasp_transform.transform_vector(
             gymapi.Vec3(1.0, 0., 0.))
@@ -178,16 +179,16 @@ class PandaFsm:
             gymapi.Vec3(-1.0, 0., 0.))
 
         # Franka Panda hand control outputs
-        self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-        self.pos_des = np.zeros(self.cfg['franka']['num_joints'])
-        self.torque_des = np.zeros(self.cfg['franka']['num_joints'])
+        self.vel_des = np.zeros(self.cfg['num_joints'])
+        self.pos_des = np.zeros(self.cfg['num_joints'])
+        self.torque_des = np.zeros(self.cfg['num_joints'])
         self.running_torque = [-0.1, -0.1]
 
         # FSM: Close state
         self.close_fails = 0
         self.left_has_contacted = False
         self.right_has_contacted = False
-        self.franka_positions_at_contact = np.zeros(self.cfg['franka']['num_joints'])
+        self.franka_positions_at_contact = np.zeros(self.cfg['num_joints'])
         self.desired_closing_gripper_pos = [0.0, 0.0]
         self.grippers_pre_squeeze = [-1, -1]
 
@@ -205,7 +206,7 @@ class PandaFsm:
         self.squeezing_close_fails = 0
         self.squeezing_no_grasp = 0
         self.squeezed_until_force = False
-        self.num_dp = self.cfg['squeeze_no_gravity']['num_dp']
+        self.num_dp = self.controller_cfg.get('num_dp', 50)
 
         # FSM: Hang state
         self.reached_hang = False
@@ -616,15 +617,15 @@ class PandaFsm:
 
         left_finger_position = np.array([
             self.hand_origin.p.x,
-            self.hand_origin.p.y + self.cfg['franka']['gripper_tip_y_offset'],
-            self.hand_origin.p.z + self.cfg['franka']['gripper_tip_z_offset'],
+            self.hand_origin.p.y + self.cfg['gripper_tip_y_offset'],
+            self.hand_origin.p.z + self.cfg['gripper_tip_z_offset'],
             1
         ])
         new_left_finger_position = fk_map_left.dot(left_finger_position)
 
         right_finger_position = np.array([
-            self.hand_origin.p.x, self.hand_origin.p.y - self.cfg['franka']['gripper_tip_y_offset'],
-            self.hand_origin.p.z + self.cfg['franka']['gripper_tip_z_offset'], 1
+            self.hand_origin.p.x, self.hand_origin.p.y - self.cfg['gripper_tip_y_offset'],
+            self.hand_origin.p.z + self.cfg['gripper_tip_z_offset'], 1
         ])
         new_right_finger_position = fk_map_right.dot(right_finger_position)
 
@@ -821,7 +822,7 @@ class PandaFsm:
         filtered_f_on_nodes, f_on_nodes_avg_of_filter = np.zeros(
             forces_on_nodes.shape), np.zeros(forces_on_nodes.shape)
 
-        w = self.cfg['lp_filter']['averaging_window']
+        w = self.cfg['franka']['lp_filter']['averaging_window']
 
         if len(self.F_history) > w:
             filtered_force = tet_based_metrics.butter_lowpass_filter(self.F_history)[-1]
@@ -1092,12 +1093,12 @@ class PandaFsm:
             lost_contact = np.all(particles_contacting_gripper == 0)
 
             self.squeeze_no_gravity_counter += 1
-            torque_step_period = self.cfg['squeeze_no_gravity']['torque_step_period']
+            torque_step_period = self.controller_cfg['squeeze_no_gravity']['torque_step_period']
 
             if self.squeeze_no_gravity_counter % torque_step_period == 0:
-                torque_step = self.cfg['squeeze_no_gravity']['soft_object_torque_step']
+                torque_step = self.controller_cfg['squeeze_no_gravity']['soft_object_torque_step']
                 if self.is_near_rigid():
-                    torque_step = self.cfg['squeeze_no_gravity']['near_rigid_object_torque_step']
+                    torque_step = self.controller_cfg['squeeze_no_gravity']['near_rigid_object_torque_step']
 
                 self.squeeze_torque -= torque_step
 
@@ -1125,9 +1126,9 @@ class PandaFsm:
             else:
                 self.squeeze_no_gravity_contact_fails = 0
 
-            f_cutoff = self.cfg['squeeze_no_gravity']['soft_object_F_des']
+            f_cutoff = self.controller_cfg['squeeze_no_gravity']['soft_object_F_des']
             if self.is_near_rigid():
-                f_cutoff = self.cfg['squeeze_no_gravity']['near_rigid_object_F_des']
+                f_cutoff = self.controller_cfg['squeeze_no_gravity']['near_rigid_object_F_des']
 
             if self.f_moving_average[-1] > f_cutoff or self.squeeze_no_gravity_contact_fails > 5:
                 if lost_contact:
@@ -1311,7 +1312,7 @@ class PandaFsm:
                 if curr_gripper_width < self.squeeze_min_gripper_width:
                     self.squeeze_min_gripper_width = curr_gripper_width
 
-            self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
+            self.vel_des = np.zeros(self.controller_cfg['franka']['num_joints'])
             self.hang_separations.append(curr_separation)
 
             # Add PID controller to achieve desired force
@@ -1404,7 +1405,7 @@ class PandaFsm:
         if self.state == 'reorient':
 
             # Components of each revolute joint in rotation direction
-            reorient_ang_vel = self.cfg['reorient']['ang_vel']
+            reorient_ang_vel = self.controller_cfg['reorient']['ang_vel']
 
             self.reorient_counter += 1
             angle_covered = self.sim_params.dt * self.reorient_counter * reorient_ang_vel
@@ -1445,9 +1446,9 @@ class PandaFsm:
             lin_acc_direction = self.direction
 
             self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-            max_lin_acc_acc = self.cfg['lin_acc']['max_acc']
+            max_lin_acc_acc = self.controller_cfg['lin_acc']['max_acc']
             Dt = self.sim_params.dt * self.lin_acc_counter
-            jerk = self.cfg['lin_acc']['jerk']
+            jerk = self.controller_cfg['lin_acc']['jerk']
             a = min(max_lin_acc_acc, jerk * Dt)
             self.lin_acc_vel += a * self.sim_params.dt
             self.lin_acc_counter += 1
@@ -1477,15 +1478,15 @@ class PandaFsm:
                 Dt = self.sim_params.dt * self.ang_acc_travel_counter
                 travel_location = np.array([0, 0, -self.cfg['franka']['gripper_tip_z_offset']])
 
-                travel_acc = self.cfg['ang_acc']['travel_acc']
+                travel_acc = self.controller_cfg['ang_acc']['travel_acc']
                 travel_offset = curr_location[-1] - travel_location[-1]
                 if (travel_offset) > (self.cfg['franka']['gripper_tip_z_offset'] / 2.):
                     self.travel_speed += travel_acc * self.sim_params.dt
                 else:
                     travel_acc = -travel_acc
                     self.travel_speed += travel_acc * self.sim_params.dt
-                self.travel_speed = min(self.travel_speed, self.cfg['ang_acc']['max_travel_speed'])
-                self.travel_speed = max(self.travel_speed, self.cfg['ang_acc']['min_travel_speed'])
+                self.travel_speed = min(self.travel_speed, self.controller_cfg['ang_acc']['max_travel_speed'])
+                self.travel_speed = max(self.travel_speed, self.controller_cfg['ang_acc']['min_travel_speed'])
 
                 travel_vel = self.travel_speed * travel_location / np.linalg.norm(
                     travel_location)
@@ -1526,9 +1527,9 @@ class PandaFsm:
 
             if self.reached_ang_acc_location:
                 self.ang_acc_counter += 1
-                max_rot_acc = self.cfg['ang_acc']['max_acc']
+                max_rot_acc = self.controller_cfg['ang_acc']['max_acc']
                 Dt = self.sim_params.dt * self.ang_acc_counter
-                jerk = self.cfg['ang_acc']['jerk']
+                jerk = self.controller_cfg['ang_acc']['jerk']
                 a = min(max_rot_acc, jerk * Dt)
 
                 self.ang_acc_vel += a * self.sim_params.dt

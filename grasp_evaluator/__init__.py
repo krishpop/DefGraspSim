@@ -2,3 +2,5 @@
 
 Object geometry, candidate grasp, and material parameters are specified.
 """
+
+from .grasp_sim import GraspSim

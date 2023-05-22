@@ -1,0 +1,9 @@
+squeeze_no_gravity:
+  num_dp: 50
+  torque_step_period: 10
+  soft_object_torque_step: 0.3
+  near_rigid_object_torque_step: 0.15
+  soft_object_F_des: 15
+  near_rigid_object_F_des: 30
+
+

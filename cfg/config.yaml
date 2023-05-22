@@ -1,0 +1,45 @@
+defaults:
+  - _self_
+  - controller: squeeze_no_gravity
+
+hydra:
+  run:
+    dir: .
+
+simulator:
+  # _target_: grasp_evaluator.GraspSim
+  tags:
+    results_storage_tag: 'mytag'
+  object_name: test
+  grasp_ind: 0
+  oris:
+    - 0
+    - 5
+  density: 1000
+  friction: 0.7
+  mode: 'squeeze_no_gravity'
+  tag: ''
+  platform_height: 1.0
+
+  use_viewer: False
+  write_results: True
+
+  timeout:
+    squeeze_no_gravity: 1000
+    other_modes: 700
+
+  dir:
+    assets_dir: 'examples'
+    franka_urdf: 'franka_description/robots/franka_panda_fem_simple_v4_with_arm.urdf'
+    results_dir: 'results'
+      
+  franka:
+    num_joints: 16
+    gripper_tip_z_offset: 0.112
+    gripper_tip_y_offset: 0.00444222
+    joint_damping: 100
+    lp_filter:
+      running_window_size: 50
+      averaging_window: 10 
+
+  controller: ${..controller}

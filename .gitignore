@@ -46,3 +46,7 @@ venv
 *.swo
 *.swa
 *checkpoint.ipynb
+*.html
+
+*.ipynb_checkpoints
+*.hydra

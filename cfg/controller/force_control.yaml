@@ -1,0 +1,4 @@
+force_control:
+  Kp: 0.002
+  min_torque: -0.05
+

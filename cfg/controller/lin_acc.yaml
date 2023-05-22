@@ -1,0 +1,3 @@
+lin_acc:
+  max_acc: 50
+  jerk: 100

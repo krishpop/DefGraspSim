@@ -1,0 +1,7 @@
+ang_acc:
+  travel_acc: 3
+  min_travel_speed: 0.1
+  max_travel_speed: 0.5
+  max_acc: 1250
+  jerk: 2500
+

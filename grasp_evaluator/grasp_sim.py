@@ -36,15 +36,22 @@ from utils import metrics_features_utils
 ACRONYM_ASSET_DIR = f"/juno/u/tylerlum/github_repos/nerf_grasping/assets"
 ACRONYM_DATA_DIR = f"/juno/u/tylerlum/github_repos/acronym/data/grasps"
 
-class GraspEvaluator:
+class GraspSim:
     """Simulate selected object, grasp, material params, and evaluation mode."""
-
-    def __init__(self, object_name, grasp_ind, oris, density,
-                 youngs, poissons, friction, mode, tag='', is_acronym=False):
+    def __init__(self, object_name: str, grasp_ind: int, oris: list, platform_height: int,
+                 use_viewer: bool, density: float, friction: float, mode: str, controller: dict,  
+                 tags: dict, timeout: dict,
+                 dir: dict, franka: dict, write_results: bool, tag: str='', is_acronym: bool = False):
         """Initialize parameters for simulation for the specific grasp and material properties."""
-        with open("config.yaml") as yamlfile:
-            self.cfg = yaml.safe_load(yamlfile)
 
+        # Set configs for submodules
+        self.dir_cfg = dir
+        self.controller_cfg = controller 
+        self.franka_cfg = franka
+        self.tags = tags
+        self.timeout = timeout
+        self.use_viewer = use_viewer
+        self.platform_height = platform_height
 
         # Soft object material parameters
         self.is_acronym = is_acronym
@@ -55,16 +62,14 @@ class GraspEvaluator:
         self.grasp_ind = grasp_ind
         self.oris = oris  # Array of [ori_start, ori_end]
         self.density = density
-        self.youngs = youngs
-        self.poissons = poissons
-        self.friction = float(friction)
+        self.friction = friction
         self.mode = mode.lower()
 
         # Directories of assets and results
-        self.assets_dir = os.path.abspath(self.cfg['dir']['assets_dir'])
+        self.assets_dir = os.path.abspath(self.dir_cfg['assets_dir'])
 
-        self.franka_urdf = os.path.abspath(self.cfg['dir']['franka_urdf'])
-        self.results_dir = os.path.abspath(self.cfg['dir']['results_dir'])
+        self.franka_urdf = os.path.abspath(self.dir_cfg['franka_urdf'])
+        self.results_dir = os.path.abspath(self.dir_cfg['results_dir'])
         if is_acronym:
             self.get_grasp_candidates_acronym()
             obj_name = '_'.join(self.object_name.split('_')[:-1])
@@ -82,12 +87,11 @@ class GraspEvaluator:
             self.object_path = os.path.join(self.assets_dir, self.object_name)
             self.object_scale = 1.0
             self.get_grasp_candidates()
+        self.write_results = write_results
         self.tag = tag
 
         # Load candidate grasp and initialize results folder
-        self.data_exists = self.init_results_folder()
-        if not self.cfg['replace_existing_results'] and self.data_exists:
-            return
+        self.init_results_folder()
 
         # Create and set up simulation environment
         self.viewer = None
@@ -102,13 +106,16 @@ class GraspEvaluator:
 
     def init_results_folder(self):
         """Create folder where results are saved. Returns whether existing results will be kept."""
-        folder_name = self.object_name + "_" + self.cfg['tags']['results_storage_tag']
-        object_file_name = self.object_name + "_" + self.density + "_" + self.youngs + "_" + \
-            self.poissons + "_" + self.mode + "_tag" + self.tag + "_results.h5"
-        self.h5_file_path = os.path.join(
-            self.results_dir, folder_name, self.youngs, object_file_name)
+        folder_name = self.object_name + "_" + self.tags['results_storage_tag']
+        # rewrite the object_file_name using f-string replacement
+        object_file_name = f"{self.object_name}_{self.density}_{self.mode}_tag{self.tag}_results.h5"
+        # object_file_name = self.object_name + "_" + self.density + "_" + self.mode + "_tag" + self.tag + "_results.h5"
 
-        if os.path.exists(self.h5_file_path) and not self.cfg['replace_existing_results']:
+
+
+        self.h5_file_path = os.path.join(self.results_dir, folder_name, object_file_name)
+
+        if os.path.exists(self.h5_file_path):
             existing_h5 = h5py.File(self.h5_file_path, 'r')
             existing_timed_out = existing_h5['timed_out'][self.grasp_ind,
                                                           self.oris[0]]
@@ -179,9 +186,9 @@ class GraspEvaluator:
         f.close()
 
     def create_sim(self):
-        return self._create_sim_flex()
+        return self._create_sim_physx()
 
-    def _create_sim_physx(self, gym):
+    def _create_sim_physx(self):
         # only tested with this one
         sim_type = gymapi.SIM_PHYSX
 
@@ -196,16 +203,15 @@ class GraspEvaluator:
         sim_params.physx.solver_type = 1
         sim_params.physx.num_position_iterations = 6
         sim_params.physx.num_velocity_iterations = 0
-        sim_params.physx.num_threads = self.cfg.num_threads
-        sim_params.physx.use_gpu = self.cfg.use_gpu
         # sim_params.physx.use_gpu = True
+        sim_params.physx.use_gpu = False
 
         # sim_params.use_gpu_pipeline = True
         sim_params.use_gpu_pipeline = False
 
         gpu_physics = 0 
         gpu_render = 0
-        if not self.cfg['use_viewer']:
+        if not self.use_viewer:
             gpu_render = -1
 
         return self.gym.create_sim(
@@ -213,46 +219,7 @@ class GraspEvaluator:
             gpu_render,
             sim_type,
             sim_params,
-        )
-
-    def _create_sim_flex(self):
-        """Set sim parameters and create a Sim object."""
-        # Set simulation parameters
-        sim_type = gymapi.SIM_FLEX
-        sim_params = gymapi.SimParams()
-        sim_params.dt = 1.0 / 1500
-        sim_params.substeps = 1
-        sim_params.gravity = gymapi.Vec3(0.0, -9.81, 0.0)
-        if self.mode in ["lin_acc", "ang_acc", "squeeze_no_gravity"]:
-            sim_params.gravity = gymapi.Vec3(0.0, 0.0, 0.0)
-
-        # Set stress visualization parameters
-        sim_params.stress_visualization = True
-        sim_params.stress_visualization_min = 1.0e2
-        sim_params.stress_visualization_max = 1e5
-
-        # Set FleX-specific parameters
-        sim_params.flex.solver_type = 5
-        sim_params.flex.num_outer_iterations = 10
-        sim_params.flex.num_inner_iterations = 200
-        sim_params.flex.relaxation = 0.75
-        sim_params.flex.warm_start = 0.8
-
-        sim_params.flex.deterministic_mode = True
-
-        # Set contact parameters
-        sim_params.flex.shape_collision_distance = 5e-4
-        sim_params.flex.contact_regularization = 1.0e-6
-        sim_params.flex.shape_collision_margin = 1.0e-4
-        sim_params.flex.dynamic_friction = self.friction
-
-        # Create Sim object
-        gpu_physics = 0
-        gpu_render = 0
-        if not self.cfg['use_viewer']:
-            gpu_render = -1
-        return self.gym.create_sim(gpu_physics, gpu_render, sim_type,
-                                   sim_params), sim_params
+        ), sim_params
 
     def create_env(self):
         """Set dimensions of environments."""
@@ -289,6 +256,13 @@ class GraspEvaluator:
         asset_options.angular_damping = 0.0  # Angular damping for rigid bodies
         asset_options.disable_gravity = True
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_VEL
+        asset_options.override_inertia = False
+        asset_options.override_com = False
+
+        asset_options.vhacd_params.mode = 0  # 0 = tetrahedron, 1 = voxel, was 1, but 0 fixed issue with xbox360
+        asset_options.vhacd_params.resolution = 600000
+        asset_options.vhacd_params.max_convex_hulls = 16
+        asset_options.vhacd_params.max_num_vertices_per_ch = 128
 
         # Load Franka and object assets
         asset_file_platform = os.path.join(self.assets_dir, 'platform.urdf')
@@ -304,9 +278,7 @@ class GraspEvaluator:
             try:
                 set_parameter_result = self.set_object_parameters(
                     asset_file_object,
-                    density=self.density,
-                    youngs=self.youngs,
-                    poissons=self.poissons)
+                    density=self.density)
             except BaseException:
                 fail_counter += 1
                 pass
@@ -320,6 +292,11 @@ class GraspEvaluator:
         asset_options.min_particle_mass = 1e-20
         self.asset_handle_object = self.gym.load_asset(self.sim, asset_root, asset_file_object,
                                                        asset_options)
+        rs_props = self.gym.get_asset_rigid_shape_properties(self.asset_handle_object)
+        for p in rs_props:
+            p.friction = self.friction
+            p.torsion_friction = self.friction
+            p.restitution = 0.0
 
         asset_options.fix_base_link = True
         self.asset_handle_platform = self.gym.load_asset(self.sim, asset_root,
@@ -331,7 +308,7 @@ class GraspEvaluator:
         camera_props.width = 1920
         camera_props.height = 1080
 
-        if self.cfg['use_viewer']:
+        if self.use_viewer:
             self.viewer = self.gym.create_viewer(self.sim, camera_props)
             camera_target = gymapi.Vec3(0.0, 1.0, 0.0)
             camera_pos = gymapi.Vec3(-0, 1.02, 0.5)
@@ -437,7 +414,7 @@ class GraspEvaluator:
             pose.p = gymapi.Vec3(test_grasp_pose[0], test_grasp_pose[1],
                                  test_grasp_pose[2])
             pose.p = self.neg_rot_x_transform.transform_vector(pose.p)
-            pose.p.y += self.cfg['sim_params']['platform_height']
+            pose.p.y += self.platform_height
             print("franka handle initial pose", np.array(pose.p))
             franka_handle = self.gym.create_actor(env_handle, self.asset_handle_franka, pose,
                                                   f"franka_{i}", collision_group, 1)
@@ -493,7 +470,7 @@ class GraspEvaluator:
             object_height_buffer = 0.001
             if self.mode == "squeeze_no_gravity":
                 object_height_buffer = 0.0
-            pose.p.y += self.cfg['sim_params']['platform_height'] + object_height_buffer
+            pose.p.y += self.platform_height + object_height_buffer
 
             object_handle = self.gym.create_actor(env_handle, self.asset_handle_object, pose,
                                                   f"object_{i}", collision_group,
@@ -542,13 +519,14 @@ class GraspEvaluator:
                 test_grasp_pose[4], test_grasp_pose[5], test_grasp_pose[6],
                 test_grasp_pose[3])
 
-            panda_fsm = pandafsm.PandaFsm(cfg=self.cfg,
+            panda_fsm = pandafsm.PandaFsm(cfg=self.franka_cfg,
+                                          controller_cfg=self.controller_cfg,
                                           gym_handle=self.gym,
                                           sim_handle=self.sim,
                                           env_handles=self.env_handles,
                                           franka_handle=self.franka_handles[i],
                                           platform_handle=self.platform_handles[i],
-                                          object_cof=self.sim_params.flex.dynamic_friction,
+                                          object_cof=self.friction,
                                           grasp_transform=grasp_transform,
                                           obj_name=self.object_name,
                                           env_id=i,
@@ -556,7 +534,7 @@ class GraspEvaluator:
                                           viewer=self.viewer,
                                           envs_per_row=self.envs_per_row,
                                           env_dim=self.env_dim,
-                                          youngs=self.youngs,
+                                          youngs=1.,
                                           density=self.density,
                                           directions=np.asarray(directions),
                                           mode=self.mode.lower())
@@ -568,10 +546,10 @@ class GraspEvaluator:
         while not all_done:
 
             # If the simulation is taking too long, declare fail
-            if (timeit.default_timer() - loop_start > self.cfg['timeout']['other_modes']
+            if (timeit.default_timer() - loop_start > self.timeout['other_modes']
                     and panda_fsms[i].state not in ['reorient', 'squeeze_no_gravity']) or (
                         timeit.default_timer()
-                        - loop_start > self.cfg['timeout']['squeeze_no_gravity']
+                        - loop_start > self.timeout['squeeze_no_gravity']
                         and panda_fsms[i].state == "squeeze_no_gravity"):
                 print("Timed out")
                 for i in range(len(self.env_handles)):
@@ -603,17 +581,17 @@ class GraspEvaluator:
             self.gym.clear_lines(self.viewer)
             self.gym.step_graphics(self.sim)
 
-            if self.cfg['use_viewer']:
+            if self.use_viewer:
                 self.gym.draw_viewer(self.viewer, self.sim, True)
 
         # Clean up
-        if self.cfg['use_viewer']:
+        if self.use_viewer:
             self.gym.destroy_viewer(self.viewer)
         self.gym.destroy_sim(self.sim)
 
         print("Finished the simulation", timeit.default_timer() - loop_start)
 
-        if self.cfg['write_results']:
+        if self.write_results:
             print("Writing to", self.h5_file_path)
             metrics_features_utils.write_metrics_to_h5(self.mode, self.grasp_ind, self.oris,
                                                        self.num_grasp_poses, self.num_directions,
