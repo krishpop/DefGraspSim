@@ -107,6 +107,10 @@ class PandaFsm:
             self.env_handle, self.franka_handle, self.finger_indices[-2])
         self.right_finger_handle = self.gym_handle.get_actor_rigid_body_handle(
             self.env_handle, self.franka_handle, self.finger_indices[-1])
+        self.rigid_body_state_tensor = self.gym_handle.acquire_rigid_body_state_tensor(self.sim_handle)
+        num_object_state_tensor = self.gym_handle.get_actor_rigid_body_count()
+        object_index = self.gym_handle.get_actor_rigid_body_index()
+        self.object_rigid_body_tensor = self.rigid_body_state_tensor[object_index:num_object_state_tensor]
         self.running_saved_franka_state = []
 
         # Object material and mesh values
@@ -435,7 +439,9 @@ class PandaFsm:
     def contact_points_on_gripper(self):
         """Get positions on the fingers that are contacting the object."""
         left_gripper_contact_points, right_gripper_contact_points = [], []
+        self.contacts = self.gym_handle.get_rigid_contacts(self.sim_handle)
         for contact in self.contacts:
+            contact
             in_same_environment = contact[2][0] in range(
                 self.env_id * self.state_tensor_length,
                 (self.env_id + 1) * self.state_tensor_length)
@@ -475,8 +481,11 @@ class PandaFsm:
     def get_contact_geometry_features(self):
         """Calculate features based on object contact geometry."""
         self.object_centroid = self.gym_handle.get_actor_rigid_body_states(self.env_handle, self.object_handle, 1).pose.p
+        object_centroid = self.object_centroid
         left_indices, right_indices, finger_indices = self.get_node_indices_contacting_fingers(
         )
+
+        self.gym_handle.get_contact
 
         left_contact_locations = np.copy(
             self.particle_state_tensor.numpy()[left_indices, :3])
@@ -490,8 +499,8 @@ class PandaFsm:
             [self.left_normal.x, self.left_normal.y, self.left_normal.z])
 
         self.pure_distances = np.array([
-            np.linalg.norm(left_contact_centroid - object_centroid),
-            np.linalg.norm(right_contact_centroid - object_centroid)
+            np.linalg.norm(left_contact_centroid - self.object_centroid),
+            np.linalg.norm(right_contact_centroid - self.object_centroid)
         ])
 
         # Get perpendicular distances
@@ -590,6 +599,7 @@ class PandaFsm:
 
     def particles_between_gripper(self):
         """Return number of contacts with grippers and number of nodes between grippers."""
+        self.contacts = self.gym_handle.get_rigid_contacts(self.sim_handle)
         franka_dof_states = self.franka_dof_states
         fk_map_left = panda_fk.get_fk(franka_dof_states['pos'],
                                       self.hand_origin,
@@ -620,33 +630,34 @@ class PandaFsm:
         # Check if the object is in contact with the gripper
         num_contacts_with_finger = np.zeros(len(self.finger_indices))
         for contact in self.contacts:
-            curr_body_index = contact[4]
+            contact_0_is_finger = contact[0] in self.finger_indices
+            curr_body_index = contact[0] if contact_0_is_finger else contact[1]
             for i in range(len(self.finger_indices)):
                 if curr_body_index == self.finger_indices[i]:
                     num_contacts_with_finger[i] += 1
 
         # Check if the object is in between the gripper
-        state_tensor = self.particle_state_tensor.numpy()[
-            self.env_id * self.state_tensor_length:(self.env_id + 1)
-            * self.state_tensor_length, :]
+        # state_tensor = self.particle_state_tensor.numpy()[
+        #     self.env_id * self.state_tensor_length:(self.env_id + 1)
+        #     * self.state_tensor_length, :]
         num_nodes_between_fingers = 0
-        for n in range(state_tensor.shape[0]):
-            pos = gymapi.Vec3(state_tensor[n][0].item(),
-                              state_tensor[n][1].item(),
-                              state_tensor[n][2].item())
-
-            pos.x -= self.env_x_offset
-            pos.z -= self.env_z_offset
-
-            left_project = pos - gymapi.Vec3(new_left_finger_position[0],
-                                             new_left_finger_position[1],
-                                             new_left_finger_position[2])
-            right_project = pos - gymapi.Vec3(new_right_finger_position[0],
-                                              new_right_finger_position[1],
-                                              new_right_finger_position[2])
-            if left_normal.dot(left_project) >= 0 and right_normal.dot(
-                    right_project) >= 0:
-                num_nodes_between_fingers += 1
+        # for n in range(state_tensor.shape[0]):
+        #     pos = gymapi.Vec3(state_tensor[n][0].item(),
+        #                       state_tensor[n][1].item(),
+        #                       state_tensor[n][2].item())
+        #
+        #     pos.x -= self.env_x_offset
+        #     pos.z -= self.env_z_offset
+        #
+        #     left_project = pos - gymapi.Vec3(new_left_finger_position[0],
+        #                                      new_left_finger_position[1],
+        #                                      new_left_finger_position[2])
+        #     right_project = pos - gymapi.Vec3(new_right_finger_position[0],
+        #                                       new_right_finger_position[1],
+        #                                       new_right_finger_position[2])
+        #     if left_normal.dot(left_project) >= 0 and right_normal.dot(
+        #             right_project) >= 0:
+        #         num_nodes_between_fingers += 1
 
         return num_contacts_with_finger, num_nodes_between_fingers
 
@@ -660,21 +671,21 @@ class PandaFsm:
         self.running_forces_on_nodes.append(self.f_on_nodes_moving_average[-1])
 
         self.running_positions.append(np.copy(
-            self.particle_state_tensor.numpy()
+            self.rigid_state_tensor.numpy()
             [self.env_id * self.state_tensor_length:(self.env_id + 1)
              * self.state_tensor_length, :])[:, :3])
 
         # Record contacts on objects
-        left_indices, right_indices, _ = self.get_node_indices_contacting_fingers_full()
-        left_contacts, right_contacts = np.zeros((self.num_nodes, 6)), np.zeros((self.num_nodes, 6))
-        try:
-            left_contacts[:left_indices.shape[0], :] = left_indices
-            right_contacts[:right_indices.shape[0], :] = right_indices
-        except BaseException:
-            pass
-        self.running_right_node_contacts.append(right_contacts)
-        self.running_left_node_contacts.append(left_contacts)
-
+        # left_indices, right_indices, _ = self.get_node_indices_contacting_fingers_full()
+        # left_contacts, right_contacts = np.zeros((self.num_nodes, 6)), np.zeros((self.num_nodes, 6))
+        # try:
+        #     left_contacts[:left_indices.shape[0], :] = left_indices
+        #     right_contacts[:right_indices.shape[0], :] = right_indices
+        # except BaseException:
+        #     pass
+        # self.running_right_node_contacts.append(right_contacts)
+        # self.running_left_node_contacts.append(left_contacts)
+        
         # Record contacts on grippers
         left_gripper_contact_points, right_gripper_contact_points = self.contact_points_on_gripper()
         left_gripper_contacts, right_gripper_contacts = np.zeros(
@@ -698,8 +709,8 @@ class PandaFsm:
             bs = 3
             self.running_forces_on_nodes = self.running_forces_on_nodes[-bs:]
             self.running_positions = self.running_positions[-bs:]
-            self.running_right_node_contacts = self.running_right_node_contacts[-bs:]
-            self.running_left_node_contacts = self.running_left_node_contacts[-bs:]
+            # self.running_right_node_contacts = self.running_right_node_contacts[-bs:]
+            # self.running_left_node_contacts = self.running_left_node_contacts[-bs:]
             self.running_l_gripper_contacts = self.running_l_gripper_contacts[-bs:]
             self.running_r_gripper_contacts = self.running_r_gripper_contacts[-bs:]
             self.running_forces = self.running_forces[-bs:]
@@ -726,9 +737,13 @@ class PandaFsm:
                                                     self.franka_handle,
                                                     self.saved_franka_state,
                                                     gymapi.STATE_ALL)
+        self.gym_handle.set_actor_rigid_body_states(self.env_handle,
+                                                    self.object_handle,
+                                                    self.saved_franka_state,
+                                                    gymapi.STATE_ALL)
 
-        self.gym_handle.set_particle_state_tensor(
-            self.sim_handle, gymtorch.unwrap_tensor(self.saved_object_state))
+        # self.gym_handle.set_particle_state_tensor(
+        #     self.sim_handle, gymtorch.unwrap_tensor(self.saved_object_state))
         print(self.env_id, "Reverting back to state", self.saved_fsm_state)
         self.inferred_rot_force_counter
         self.state = self.saved_fsm_state
@@ -1008,8 +1023,6 @@ class PandaFsm:
                 self.particle_state_tensor.shape[0]
                 / self.gym_handle.get_env_count(self.sim_handle))
  
-        self.get_state_tensor_length()
-
         self.full_counter += 1
 
         # Get hand states, soft contacts
