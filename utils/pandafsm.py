@@ -28,14 +28,14 @@ from isaacgym import gymtorch
 from utils import panda_fk
 from utils import tet_based_metrics
 
-DEBUG = False
+DEBUG = True
 
 
 class PandaFsm:
     """FSM for control of Panda hand for the grasp tests."""
 
     def __init__(self, cfg, controller_cfg, gym_handle, sim_handle, env_handles, franka_handle,
-                 platform_handle, object_cof,
+                 object_handle, platform_handle, object_cof,
                  grasp_transform, obj_name, env_id, hand_origin, viewer,
                  envs_per_row, env_dim, youngs, density, directions, mode):
         """Initialize attributes of grasp evaluation FSM.
@@ -44,6 +44,7 @@ class PandaFsm:
             sim_handle (gymapi.Sim): Simulation object.
             env_handles (list of gymapi.Env): List of all environments.
             franka_handle (int): Handle of Franka panda hand actor.
+            object_handle (int): Handle of object actor.
             platform_handle (int): Handle of support plane actor.
             state (str): Name of initial FSM state.
             object_cof (float): Coefficient of friction.
@@ -85,6 +86,7 @@ class PandaFsm:
 
         # Actors
         self.franka_handle = franka_handle
+        self.object_handle = object_handle
         self.platform_handle = platform_handle
         num_franka_bodies = self.gym_handle.get_actor_rigid_body_count(
             self.env_handle, self.franka_handle)
@@ -110,9 +112,6 @@ class PandaFsm:
         # Object material and mesh values
         self.obj_name = obj_name
         self.object_cof = object_cof
-        self.particle_state_tensor = gymtorch.wrap_tensor(
-            self.gym_handle.acquire_particle_state_tensor(self.sim_handle))
-        self.previous_particle_state_tensor = None
         self.state_tensor_length = 0
         self.youngs = float(youngs)
         self.density = float(density)
@@ -123,12 +122,12 @@ class PandaFsm:
         self.FOS = 1 + np.log10(self.youngs) / 10.
         self.initial_desired_force = 0.0
         self.corrected_desired_force = 0.0
-        self.F_history, self.stress_history, self.F_on_nodes_history = [], [], []
+        self.F_history, self.F_on_nodes_history = [], []
 
         # Low pass filtering of physics
         self.lp_running_window_size = self.cfg['lp_filter']['running_window_size']
-        self.filtered_forces, self.filtered_stresses, self.filtered_f_on_nodes = [], [], []
-        self.f_moving_average, self.stress_moving_average = [], []
+        self.filtered_forces, self.filtered_f_on_nodes = [], []
+        self.f_moving_average = []
         self.f_on_nodes_moving_average = []
         self.f_errs = np.ones(10, dtype=np.float32)
 
@@ -210,7 +209,6 @@ class PandaFsm:
 
         # FSM: Hang state
         self.reached_hang = False
-        self.hang_stresses = []
         self.hang_separations = []
 
         # FSM: Pickup
@@ -238,29 +236,20 @@ class PandaFsm:
         """Initialize attributes to store metrics and features."""
         # Tet structure
         self.num_nodes = self.state_tensor_length
-        (tet_particles,
-         tet_stresses) = self.gym_handle.get_sim_tetrahedra(self.sim_handle)
         num_envs = self.gym_handle.get_env_count(self.sim_handle)
-        num_tets_per_env = int(len(tet_stresses) / num_envs)
-        self.undeformed_mesh = np.zeros((self.num_nodes, 3))
 
         # Pre contact
-        self.pre_contact_stresses = np.zeros((num_envs, num_tets_per_env))
         self.pre_contact_se = 0.0
 
         # Metrics at target squeeze force
-        self.stresses_at_force = np.zeros(num_tets_per_env)
-        self.se_at_force = 0.0
         self.positions_at_force = np.zeros((self.num_nodes, 3))
         self.gripper_force_at_force = 0.0
         self.gripper_distance_at_force = 0.0
 
         # Squeeze no gravity
         self.squeeze_torque = np.ones(2) * -0.1
-        self.squeeze_stress = np.zeros(num_tets_per_env)
-        self.squeeze_stresses_window = [np.zeros(num_tets_per_env)] * 10
         self.running_left_node_contacts, self.running_right_node_contacts = [], []
-        self.running_stresses, self.running_positions = [], []
+        self.running_positions = []
         self.running_gripper_positions, self.running_forces = [], []
         self.running_forces_on_nodes = []
         self.stacked_left_node_contacts, self.stacked_right_node_contacts = np.zeros(
@@ -274,20 +263,17 @@ class PandaFsm:
         self.stacked_right_gripper_contact_points = np.zeros((self.num_dp, self.num_nodes, 3))
         self.stacked_forces = np.zeros(self.num_dp)
 
-        self.stacked_stresses, self.stacked_positions = np.zeros(
-            (self.num_dp, num_tets_per_env)), np.zeros(
+        self.stacked_positions = np.zeros(
             (self.num_dp, self.num_nodes, 3))
         self.stacked_gripper_positions = np.zeros((self.num_dp, 2))
 
         # Metrics after pickup
-        self.stresses_under_gravity = np.zeros(num_tets_per_env)
         self.se_under_gravity = 0.0
         self.positions_under_gravity = np.zeros((self.num_nodes, 3))
         self.gripper_force_under_gravity = 0.0
 
         # Reorientation metrics
         self.reorientation_meshes = np.zeros((4, self.num_nodes, 3))
-        self.reorientation_stresses = np.zeros((4, num_tets_per_env))
 
         # Linear and angular accelerations at fail
         self.lin_acc_fail_acc, self.ang_acc_fail_acc = 0, 0
@@ -339,14 +325,14 @@ class PandaFsm:
         forces_on_nodes = np.zeros(self.state_tensor_length)
 
         for contact in self.contacts:
-            curr_body_index = contact[4]
+            curr_body_index = contact['body0']
 
             # If the rigid body (identified by body_index) is in contact
             if curr_body_index in body_index:
-                curr_force_dir = contact[6].view(
+                curr_force_dir = contact['normal'].view(
                     (np.float32, len(
-                        contact[6].dtype.names)))
-                curr_force_mag = contact[7]
+                        contact.normal.dtype.names)))
+                curr_force_mag = contact['lambda']
                 normal_to_gripper = self.grasp_transform.transform_vector(
                     gymapi.Vec3(1., 0., 0.))
 
@@ -488,10 +474,7 @@ class PandaFsm:
 
     def get_contact_geometry_features(self):
         """Calculate features based on object contact geometry."""
-        _, _, _, object_centroid = tet_based_metrics.get_tet_based_metrics(
-            self.gym_handle, self.sim_handle, self.env_handles, self.env_id,
-            self.particle_state_tensor, self.youngs)
-        self.object_centroid = object_centroid
+        self.object_centroid = self.gym_handle.get_actor_rigid_body_states(self.env_handle, self.object_handle, 1).pose.p
         left_indices, right_indices, finger_indices = self.get_node_indices_contacting_fingers(
         )
 
@@ -672,9 +655,8 @@ class PandaFsm:
         return self.youngs > 1e8
 
     def record_running_metrics(self, keep_buffer=False):
-        """Record stresses and positions over a grasp trajectory."""
+        """Record positions over a grasp trajectory."""
         # Record stress, positions
-        self.running_stresses.append(self.stress_moving_average[-1])
         self.running_forces_on_nodes.append(self.f_on_nodes_moving_average[-1])
 
         self.running_positions.append(np.copy(
@@ -707,9 +689,6 @@ class PandaFsm:
         self.running_l_gripper_contacts.append(left_gripper_contacts)
         self.running_r_gripper_contacts.append(right_gripper_contacts)
 
-        # Record stresses
-        self.running_forces.append(self.f_moving_average[-1])
-
         # Record gripper positions
         curr_gripper_positions = np.copy(
             self.franka_dof_states['pos'][-2:])
@@ -717,7 +696,6 @@ class PandaFsm:
 
         if keep_buffer:
             bs = 3
-            self.running_stresses = self.running_stresses[-bs:]
             self.running_forces_on_nodes = self.running_forces_on_nodes[-bs:]
             self.running_positions = self.running_positions[-bs:]
             self.running_right_node_contacts = self.running_right_node_contacts[-bs:]
@@ -726,12 +704,6 @@ class PandaFsm:
             self.running_r_gripper_contacts = self.running_r_gripper_contacts[-bs:]
             self.running_forces = self.running_forces[-bs:]
             self.running_gripper_positions = self.running_gripper_positions[-bs:]
-
-    def update_previous_particle_state_tensor(self):
-        """Save copy of previous timestep's particle state tensor."""
-        if self.particle_state_tensor is not None:
-            self.previous_particle_state_tensor = np.copy(
-                self.particle_state_tensor.numpy())
 
     def save_full_state(self):
         """Save current state."""
@@ -784,773 +756,297 @@ class PandaFsm:
         self.gym_handle.set_actor_dof_properties(
             self.env_handle, self.franka_handle, dof_props)
 
+    def check_collision_and_transition(self, f_avg_of_filter, f_eps=1e-3):
+        self.started = True
+        self.open_counter += 1
+
+        # Save the initial metrics and features
+        self.init_metrics_and_features()
+
+        # Save current untouched mesh
+        object_mass = self.gym_handle.get_actor_rigid_body_properties(self.env_handle, self.object_handle)['mass']
+        self.mg = 9.81 * object_mass
+        self.desired_force = self.fos * 9.81 * object_mass / self.object_cof
+        self.initial_desired_force = self.desired_force
+
+        # If hand starts in contact with object, end the test
+        if len(self.get_node_indices_contacting_body("hand")) > 0:
+            print(self.env_id, "in collision")
+            self.state = 'done'
+
+        # Save state, then transition to close
+        self.save_full_state()
+
+        # transition when avg forces are close to desired (takes a couple of iterations)
+        if np.abs(f_avg_of_filter - self.desired_force).sum() < f_eps:
+            self.state = "close"
+
+    def close_grippers(self, f_curr):
+        # Close grippers and update the hand state
+        closing_speeds = np.zeros(self.cfg['franka']['num_joints'])
+        closing_speeds[-2:] = -0.7 * np.ones(2)
+        self.vel_des = np.copy(closing_speeds)
+
+        # Close fingers only until initial contact is made
+        if np.abs(f_curr[0]) > 0.0 or self.particles_contacting_gripper[0] > 0:
+            self.desired_closing_gripper_pos[0] = self.franka_dof_states['pos'][-3:][1]
+            self.left_has_contacted = True
+
+        if np.abs(f_curr[1]) > 0.0 or self.particles_contacting_gripper[1] > 0:
+            self.desired_closing_gripper_pos[1] = self.franka_dof_states['pos'][-3:][2]
+            self.right_has_contacted = True
+
+        return closing_speeds
+
+    def catch_failure_case_for_contact(self, finger_lower_limit):
+        if not (self.left_has_contacted and self.right_has_contacted) and \
+                (self.franka_dof_states['pos'][-3:][1] < finger_lower_limit and
+                 self.franka_dof_states['pos'][-3:][2] < finger_lower_limit):
+            print(self.env_id, "failed: grippers closed without contacting object.")
+            self.state = 'done'
+
+    def check_closed_and_transition(self, f_curr):
+        closing_speeds = np.zeros(self.cfg['franka']['num_joints'])
+        self.vel_des = self.close_grippers(f_curr)
+
+        in_contact = self.left_has_contacted and self.right_has_contacted
+
+        # Catch failure case where object is not between the fingers
+        finger_lower_limit = -0.004
+        self.catch_failure_case_for_contact(finger_lower_limit)
+
+        # Check for state transition
+        if in_contact:
+            self.franka_positions_at_contact = np.copy(self.franka_dof_states['pos'])
+            self.vel_des = np.copy(closing_speeds)
+            self.reset_saved_state()
+            self.state = 'start_closer'
+
+    def lock_maximum_finger_positions(self, desired_speed):
+        self.vel_des[-2:] = desired_speed * np.ones(2)
+
+    def check_collision_start_closer_and_transition(self):
+        # Close grippers until grippers are close to contacting the object.
+        condition = self.franka_dof_states['pos'][-2:] < self.franka_positions_at_contact[-2:] + 0.003
+        self.vel_des[-2:] = np.where(condition, 0.0, self.vel_des[-2:])
+
+        # Transition to 'close_soft' state if the grippers are close enough
+        if np.all(self.franka_dof_states['pos'][-2:] < self.franka_positions_at_contact[-2:] + 0.004):
+            self.lock_maximum_finger_positions(1e-6)
+            self.state = 'close_soft'
+            self.save_full_state()
+
+    def check_closed_and_holding_and_transition(self, f_curr):
+        # Closing speed decreases every time initial contact forces are too high
+        first_speed = 0.25 / np.log10(self.youngs)
+        closing_speeds = np.zeros(self.cfg['franka']['num_joints'])
+        num_fails = self.close_fails
+        closing_speeds[-2:] = np.array([
+            -first_speed / (num_fails + 1),
+            -first_speed / (num_fails + 1)
+        ])
+
+        if np.sum(f_curr) > 300 * np.log10(self.youngs) / 4:
+            self.close_fails += 1
+            self.left_has_contacted, self.right_has_contacted = False, False
+            print(self.env_id, "Forces too high during close_soft, resetting state",
+                  np.sum(f_curr[1:]))
+            self.reset_saved_state()
+
+        force_threshold = 0.005
+        if self.mode == "squeeze_no_gravity":
+            force_threshold = 0.02
+
+        left_in_contact = np.abs(f_curr[0]) > force_threshold
+        right_in_contact = np.abs(f_curr[1]) > force_threshold
+
+        if left_in_contact:
+            closing_speeds[-2] = 0.0
+        if right_in_contact:
+            closing_speeds[-1] = 0.0
+        self.vel_des = np.copy(closing_speeds)
+
+        left_indices, right_indices, _ = self.get_node_indices_contacting_fingers()
+        left_contacts, right_contacts = np.zeros(self.num_nodes), np.zeros(self.num_nodes)
+        left_contacts[left_indices] = 1
+        right_contacts[right_indices] = 1
+
+        self.right_gripper_node_contacts_initial += right_contacts
+        self.left_gripper_node_contacts_initial += left_contacts
+
+        self.record_running_metrics(keep_buffer=True)
+
+        in_contact = left_in_contact and right_in_contact
+        if in_contact:
+            self.grippers_pre_squeeze = [
+                self.franka_dof_states['pos'][-3:][1],
+                self.franka_dof_states['pos'][-3:][2]
+            ]
+
+            self.left_gripper_node_contacts_initial = np.clip(
+                self.left_gripper_node_contacts_initial, 0.0, 1.0)
+            self.right_gripper_node_contacts_initial = np.clip(
+                self.right_gripper_node_contacts_initial, 0.0, 1.0)
+
+            # Freeze maximum gripper joint position
+            if not self.is_near_rigid():
+                self.lock_maximum_finger_positions(1e-6)
+
+            self.state = "squeeze_holding"
+            print(self.env_id, "Squeezing object")
+
+    def check_squeeze_holding_and_transition(self):
+        self.torque_des[-2:] = self.squeeze_torque
+        self.squeeze_holding_counter += 1
+
+        if self.squeeze_holding_counter % 10 == 0:
+            self.squeeze_torque -= 0.01
+
+        self.record_running_metrics()
+
+        if np.all(self.particles_contacting_gripper != 0):
+
+            self.state = "squeeze_no_gravity"
+            print(self.env_id, "Squeezing without gravity begins")
+
+            # Freeze maximum gripper joint position
+            self.lock_maximum_finger_positions(1e-6)
+
+    def check_squeeze_keep_contact_and_finish(self):
+        """SQUEEZE NO GRAVITY: Fingers close via increasing torque until desired force is reached"""
+
+        self.torque_des[-2:] = self.squeeze_torque
+
+        lost_contact = np.all(particles_contacting_gripper == 0)
+
+        self.squeeze_no_gravity_counter += 1
+        torque_step_period = self.controller_cfg['squeeze_no_gravity']['torque_step_period']
+
+        if self.squeeze_no_gravity_counter % torque_step_period == 0:
+            torque_step = self.controller_cfg['squeeze_no_gravity']['soft_object_torque_step']
+            if self.is_near_rigid():
+                torque_step = self.controller_cfg['squeeze_no_gravity']['near_rigid_object_torque_step']
+
+            self.squeeze_torque -= torque_step
+
+            self.record_running_metrics()
+
+            # if not self.is_near_rigid():
+            #     self.lock_maximum_finger_positions(0.0)
+
+            # Check if forces are not increasing
+            if len(self.running_forces) > 3:
+                if self.running_forces[-1] < self.running_forces[-2] and not lost_contact:
+                    self.squeeze_no_gravity_force_increase_fails += 1
+                if self.running_forces[-1] >= self.running_forces[-2] and not lost_contact:
+                    self.squeeze_no_gravity_force_increase_fails = 0
+
+            if self.squeeze_no_gravity_force_increase_fails > 5:
+                self.squeeze_no_gravity_max_force = self.f_moving_average[-1]
+                self.squeeze_no_gravity_failed_to_increase = True
+                print("Could not increase squeezing force")
+                self.state = "done"
+
+        # Check if contact has been lost for consecutive steps
+        if lost_contact:
+            self.squeeze_no_gravity_contact_fails += 1
+        else:
+            self.squeeze_no_gravity_contact_fails = 0
+
+        f_cutoff = self.controller_cfg['squeeze_no_gravity']['soft_object_F_des']
+        if self.is_near_rigid():
+            f_cutoff = self.controller_cfg['squeeze_no_gravity']['near_rigid_object_F_des']
+
+        if self.f_moving_average[-1] > f_cutoff or self.squeeze_no_gravity_contact_fails > 5:
+            if lost_contact:
+                print("Lost contact during squeezing without gravity")
+                self.squeeze_no_gravity_lost_contact = True
+
+            # Select self.num_dp points from each running list
+            total_dp = len(self.running_stresses)
+            if total_dp > 0:
+                self.running_stresses, self.running_positions = np.asarray(
+                    self.running_stresses), np.asarray(self.running_positions)
+                self.running_forces_on_nodes = np.asarray(self.running_forces_on_nodes)
+                self.running_right_node_contacts = np.asarray(self.running_right_node_contacts)
+                self.running_left_node_contacts = np.asarray(self.running_left_node_contacts)
+                self.running_gripper_positions = np.asarray(self.running_gripper_positions)
+
+                idx = np.round(np.linspace(0, total_dp - 1, self.num_dp)).astype(int)
+                self.stacked_stresses = self.running_stresses[idx, :]
+                self.stacked_positions = self.running_positions[idx, :, :]
+                self.stacked_right_node_contacts = self.running_right_node_contacts[idx, :, :]
+                self.stacked_left_node_contacts = self.running_left_node_contacts[idx, :, :]
+                self.stacked_gripper_positions = self.running_gripper_positions[idx, :]
+                self.stacked_forces_on_nodes = self.running_forces_on_nodes[idx, :]
+
+                self.running_l_gripper_contacts = np.asarray(
+                    self.running_l_gripper_contacts)
+                self.running_r_gripper_contacts = np.asarray(
+                    self.running_r_gripper_contacts)
+                self.stacked_left_gripper_contact_points = self.running_l_gripper_contacts[
+                    idx, :, :]
+                self.stacked_right_gripper_contact_points = self.running_r_gripper_contacts[
+                    idx, :, :]
+
+                self.running_forces = np.asarray(self.running_forces)
+                self.stacked_forces = self.running_forces[idx]
+
+            self.squeeze_no_gravity_max_force = self.f_moving_average[-1]
+            print(
+                self.env_id,
+                "Squeezed to force with max force",
+                self.squeeze_no_gravity_max_force)
+            self.state = "done"
+
     def run_state_machine(self):
         """Run state machine for running grasp tests."""
-        # Get length of state tensor
-        if self.particle_state_tensor is not None and self.state_tensor_length == 0:
+
+        # Get the state tensor length
+        if self.state_tensor_length == 0:
             self.state_tensor_length = int(
                 self.particle_state_tensor.shape[0]
                 / self.gym_handle.get_env_count(self.sim_handle))
-            print("State tensor length", self.state_tensor_length)
+ 
+        self.get_state_tensor_length()
 
         self.full_counter += 1
 
         # Get hand states, soft contacts
-        self.franka_dof_states = self.gym_handle.get_actor_dof_states(
-            self.env_handle, self.franka_handle, gymapi.STATE_ALL)
-        if self.started:
-            self.contacts = self.gym_handle.get_soft_contacts(self.sim_handle)
+        self.get_hand_states_and_contacts()
 
-        # Process finger grasp forces and stresses with LP filter and moving average
-        F_curr, forces_on_nodes = self.get_grasp_F_curr(self.finger_indices)
-        self.curr_stress = tet_based_metrics.get_stresses_only(
-            self.gym_handle, self.sim_handle, self.env_handles,
-            self.env_id, self.particle_state_tensor)[self.env_id]
+        # Process finger grasp forces with low-pass filter and moving average
+        f_curr, forces_on_nodes = self.get_grasp_f_curr(self.finger_indices)
 
-        self.F_history.append(np.sum(F_curr))
-        self.stress_history.append(self.curr_stress)
-        self.F_on_nodes_history.append(forces_on_nodes)
+        self.update_force_history(f_curr, forces_on_nodes)
 
-        self.F_history = self.F_history[-self.lp_running_window_size:]
-        self.stress_history = self.stress_history[-self.lp_running_window_size:]
-        self.F_on_nodes_history = self.F_on_nodes_history[-self.lp_running_window_size:]
+        filtered_force, filtered_f_on_nodes, f_avg_of_filter, f_on_nodes_avg_of_filter =\
+            self.update_filter_values()
 
-        filtered_force, f_avg_of_filter = 0.0, 0.0
-        filtered_stress, stress_avg_of_filter = np.zeros(
-            self.curr_stress.shape), np.zeros(
-            self.curr_stress.shape)
-        filtered_f_on_nodes, f_on_nodes_avg_of_filter = np.zeros(
-            forces_on_nodes.shape), np.zeros(forces_on_nodes.shape)
+        # Get the number of contacts and gripper separation
+        self.get_particles_contacting_gripper_and_separation()
 
-        w = self.cfg['franka']['lp_filter']['averaging_window']
-
-        if len(self.F_history) > w:
-            filtered_force = tet_based_metrics.butter_lowpass_filter(self.F_history)[-1]
-
-        if len(self.stress_history) > w:
-            filtered_stress = tet_based_metrics.butter_lowpass_filter(
-                np.asarray(self.stress_history))[-1]
-
-        if len(self.F_on_nodes_history) > w:
-            filtered_f_on_nodes = tet_based_metrics.butter_lowpass_filter(
-                np.asarray(self.F_on_nodes_history))[-1]
-
-        self.filtered_forces.append(filtered_force)
-        self.filtered_stresses.append(filtered_stress)
-        self.filtered_f_on_nodes.append(filtered_f_on_nodes)
-
-        if len(self.F_history) > 0:
-            f_avg_of_filter = np.mean(self.filtered_forces[-w:])
-        if len(self.stress_history) > 0:
-            stress_avg_of_filter = np.mean(np.asarray(self.filtered_stresses[-w:]), axis=0)
-            self.filtered_stresses = self.filtered_stresses[-w:]
-        if len(self.F_on_nodes_history) > 0:
-            f_on_nodes_avg_of_filter = np.mean(np.asarray(self.filtered_f_on_nodes[-w:]), axis=0)
-
-        self.f_moving_average.append(f_avg_of_filter)
-        self.stress_moving_average.append(stress_avg_of_filter)
-        self.f_on_nodes_moving_average.append(f_on_nodes_avg_of_filter)
-
-        # To reduce memory, save only the most recent 3 values in the buffer
-        self.stress_moving_average = self.stress_moving_average[-3:]
-        self.f_on_nodes_moving_average = self.f_on_nodes_moving_average[-3:]
-
-        # Get num_contacts, gripper_separation
-        try:
-            particles_contacting_gripper, _ = self.particles_between_gripper()
-            self.particles_contacting_gripper = particles_contacting_gripper
-        except BaseException:
-            particles_contacting_gripper = self.particles_contacting_gripper
-
-        curr_separation = np.sum([
-            self.franka_dof_states['pos'][-3:][1],
-            self.franka_dof_states['pos'][-3:][2]
-        ])
-
-        ############################################################################
-        # OPEN STATE: Hand is initialized in a state where the fingers are open
-        ############################################################################
+        # State logic
         if self.state == 'open':
-            self.started = True
-            self.open_counter += 1
+            f_eps = 1e-3
+            self.check_collision_and_transition(f_avg_of_filter, f_eps)
 
-            self.init_metrics_and_features()
-
-            # Save current untouched mesh
-            self.undeformed_mesh = np.copy(
-                self.particle_state_tensor.numpy()
-                [self.env_id * self.state_tensor_length:(self.env_id + 1)
-                    * self.state_tensor_length, :][:, :3])
-
-            # Get pre-contact stresses, SE, and weight
-            self.pre_contact_stresses, self.pre_contact_se, \
-                object_volume, _ = tet_based_metrics.get_tet_based_metrics(
-                    self.gym_handle, self.sim_handle, self.env_handles,
-                    self.env_id, self.particle_state_tensor, self.youngs)
-            self.pre_contact_stresses = self.pre_contact_stresses[
-                self.env_id]
-            self.mg = 9.81 * object_volume * self.density
-            self.desired_force = self.FOS * 9.81 \
-                * object_volume * self.density / self.object_cof
-            self.initial_desired_force = self.desired_force
-
-            # If hand starts in contact with object, end test
-            if len(self.get_node_indices_contacting_body("hand")) > 0:
-                print(self.env_id, "in collision")
-                self.state = 'done'
-
-            # Save state, then transition to close
-            self.save_full_state()
-
-            # Transition when mesh stresses aren't zero (takes a couple of iterations)
-            if not np.all(self.pre_contact_stresses == 0):
-                self.state = "close"
-
-        ############################################################################
-        # CLOSE STATE: Fingers close rapidly until contact with object is made
-        ############################################################################
         if self.state == 'close':
-            closing_speeds = np.zeros(self.cfg['franka']['num_joints'])
-            closing_speeds[-2:] = -0.7 * np.ones(2)
-            self.vel_des = np.copy(closing_speeds)
+            self.check_closed_and_transition(f_curr)
 
-            # Close fingers only until initial contact is made
-            if np.abs(F_curr[0]) > 0.0 or self.particles_contacting_gripper[0] > 0:
-                self.desired_closing_gripper_pos[0] = self.franka_dof_states[
-                    'pos'][-3:][1]
-                self.left_has_contacted = True
+        if self.state == 'start_closer':
+            self.check_collision_start_closer_and_transition()
 
-            if np.abs(F_curr[1]) > 0.0 or self.particles_contacting_gripper[1] > 0:
-                self.desired_closing_gripper_pos[1] = self.franka_dof_states[
-                    'pos'][-3:][2]
-                self.right_has_contacted = True
-
-            if self.left_has_contacted:
-                self.vel_des[-3:][1] = 0
-            if self.right_has_contacted:
-                self.vel_des[-3:][2] = 0
-
-            in_contact = self.left_has_contacted and self.right_has_contacted
-
-            # Catch failure case where object is not between fingers
-            finger_lower_limit = -0.004
-            if not in_contact and (
-                    self.franka_dof_states['pos'][-3:][1] < finger_lower_limit
-                    and self.franka_dof_states['pos'][-3:][2] < finger_lower_limit):
-                print(self.env_id,
-                      "Failed: Grippers closed without contacting object.")
-                self.state = 'done'
-
-            # Check for state transition
-            if in_contact:
-                self.franka_positions_at_contact = np.copy(
-                    self.franka_dof_states['pos'])
-                self.vel_des = np.copy(closing_speeds)
-                self.reset_saved_state()
-                self.state = 'start_closer'
-
-        ############################################################################
-        # START_CLOSER STATE: Reset back to open position, fingers close rapidly until
-        # close to making contact with the object.
-        ############################################################################
-        elif self.state == 'start_closer':
-            """Close grippers until grippers are close to contacting object."""
-
-            if self.franka_dof_states['pos'][
-                    -2] < self.franka_positions_at_contact[-2] + 0.003:
-                self.vel_des[-2] = 0.0
-
-            if self.franka_dof_states['pos'][
-                    -1] < self.franka_positions_at_contact[-1] + 0.003:
-                self.vel_des[-1] = 0.0
-
-            if np.all(self.franka_dof_states['pos'][-2:]
-                      < self.franka_positions_at_contact[-2:] + 0.004):
-
-                self.lock_maximum_finger_positions(1e-6)
-
-                self.state = 'close_soft'
-                self.save_full_state()
-
-        ############################################################################
-        # CLOSE_SOFT STATE: Fingers close via position control until contact with object is made
-        ############################################################################
         if self.state == 'close_soft':
+            self.check_closed_and_holding_and_transition(f_curr)
 
-            # Closing speed decreases every time initial contact forces are too high
-            first_speed = 0.25 / np.log10(self.youngs)
-            closing_speeds = np.zeros(self.cfg['franka']['num_joints'])
-            num_fails = self.close_fails
-            closing_speeds[-2:] = np.array([
-                -first_speed / (num_fails + 1),
-                -first_speed / (num_fails + 1)
-            ])
+        if self.state == 'squeeze_holding':
+            self.check_squeeze_holding_and_transition()
 
-            if np.sum(F_curr) > 300 * np.log10(self.youngs) / 4:
-                self.close_fails += 1
-                self.left_has_contacted, self.right_has_contacted = False, False
-                print(self.env_id, "Forces too high during close_soft, resetting state",
-                      np.sum(F_curr[1:]))
-                self.reset_saved_state()
+        if self.state == 'squeeze_no_gravity':
+            self.check_squeeze_keep_contact_and_finish()
 
-            force_threshold = 0.005
-            if self.mode == "squeeze_no_gravity":
-                force_threshold = 0.02
-
-            left_in_contact = np.abs(F_curr[0]) > force_threshold
-            right_in_contact = np.abs(F_curr[1]) > force_threshold
-
-            if left_in_contact:
-                closing_speeds[-2] = 0.0
-            if right_in_contact:
-                closing_speeds[-1] = 0.0
-            self.vel_des = np.copy(closing_speeds)
-
-            left_indices, right_indices, _ = self.get_node_indices_contacting_fingers()
-            left_contacts, right_contacts = np.zeros(self.num_nodes), np.zeros(self.num_nodes)
-            left_contacts[left_indices] = 1
-            right_contacts[right_indices] = 1
-
-            self.right_gripper_node_contacts_initial += right_contacts
-            self.left_gripper_node_contacts_initial += left_contacts
-
-            # Update window of stresses
-            self.squeeze_stress = tet_based_metrics.get_stresses_only(
-                self.gym_handle, self.sim_handle, self.env_handles,
-                self.env_id, self.particle_state_tensor)[self.env_id]
-            self.squeeze_stresses_window.append(self.squeeze_stress)
-            if len(self.squeeze_stresses_window) > 5:
-                self.squeeze_stresses_window.pop(0)
-
-            self.record_running_metrics(keep_buffer=True)
-
-            in_contact = left_in_contact and right_in_contact
-            if in_contact:
-                self.grippers_pre_squeeze = [
-                    self.franka_dof_states['pos'][-3:][1],
-                    self.franka_dof_states['pos'][-3:][2]
-                ]
-
-                self.left_gripper_node_contacts_initial = np.clip(
-                    self.left_gripper_node_contacts_initial, 0.0, 1.0)
-                self.right_gripper_node_contacts_initial = np.clip(
-                    self.right_gripper_node_contacts_initial, 0.0, 1.0)
-
-                # Freeze maximum gripper joint position
-                if not self.is_near_rigid():
-                    self.lock_maximum_finger_positions(1e-6)
-
-                if self.mode == "squeeze_no_gravity":
-                    self.state = "squeeze_holding"
-
-                else:
-                    self.state = "squeeze"
-                    print(self.env_id, "Squeezing object")
-
-        ##########################################################################################
-        # SQUEEZE HOLDING: Fingers close via increasing torque until contact with object is made
-        ##########################################################################################
-        if self.state == "squeeze_holding":
-            self.torque_des[-2:] = self.squeeze_torque
-            self.squeeze_holding_counter += 1
-
-            if self.squeeze_holding_counter % 10 == 0:
-                self.squeeze_torque -= 0.01
-
-            # Update window of stresses
-            self.squeeze_stress = tet_based_metrics.get_stresses_only(
-                self.gym_handle, self.sim_handle, self.env_handles,
-                self.env_id, self.particle_state_tensor)[self.env_id]
-            self.squeeze_stresses_window.append(self.squeeze_stress)
-            if len(self.squeeze_stresses_window) > 5:
-                self.squeeze_stresses_window.pop(0)
-
-            self.record_running_metrics()
-
-            if np.all(self.particles_contacting_gripper != 0):
-
-                self.state = "squeeze_no_gravity"
-                print(self.env_id, "Squeezing without gravity begins")
-
-                # Freeze maximum gripper joint position
-                self.lock_maximum_finger_positions(1e-6)
-
-        ##########################################################################################
-        # SQUEEZE NO GRAVITY: Fingers close via increasing torque until desired force is reached
-        ##########################################################################################
-        if self.state == "squeeze_no_gravity":
-
-            self.torque_des[-2:] = self.squeeze_torque
-
-            # Update window of stresses
-            self.squeeze_stress = tet_based_metrics.get_stresses_only(
-                self.gym_handle, self.sim_handle, self.env_handles,
-                self.env_id, self.particle_state_tensor)[self.env_id]
-            self.squeeze_stresses_window.append(self.squeeze_stress)
-            if len(self.squeeze_stresses_window) > 10:
-                self.squeeze_stresses_window.pop(0)
-
-            lost_contact = np.all(particles_contacting_gripper == 0)
-
-            self.squeeze_no_gravity_counter += 1
-            torque_step_period = self.controller_cfg['squeeze_no_gravity']['torque_step_period']
-
-            if self.squeeze_no_gravity_counter % torque_step_period == 0:
-                torque_step = self.controller_cfg['squeeze_no_gravity']['soft_object_torque_step']
-                if self.is_near_rigid():
-                    torque_step = self.controller_cfg['squeeze_no_gravity']['near_rigid_object_torque_step']
-
-                self.squeeze_torque -= torque_step
-
-                self.record_running_metrics()
-
-                if not self.is_near_rigid():
-                    self.lock_maximum_finger_positions(0.0)
-
-                # Check if forces are not increasing
-                if len(self.running_forces) > 3:
-                    if self.running_forces[-1] < self.running_forces[-2] and not lost_contact:
-                        self.squeeze_no_gravity_force_increase_fails += 1
-                    if self.running_forces[-1] >= self.running_forces[-2] and not lost_contact:
-                        self.squeeze_no_gravity_force_increase_fails = 0
-
-                if self.squeeze_no_gravity_force_increase_fails > 5:
-                    self.squeeze_no_gravity_max_force = self.f_moving_average[-1]
-                    self.squeeze_no_gravity_failed_to_increase = True
-                    print("Could not increase squeezing force")
-                    self.state = "done"
-
-            # Check if contact has been lost for consecutive steps
-            if lost_contact:
-                self.squeeze_no_gravity_contact_fails += 1
-            else:
-                self.squeeze_no_gravity_contact_fails = 0
-
-            f_cutoff = self.controller_cfg['squeeze_no_gravity']['soft_object_F_des']
-            if self.is_near_rigid():
-                f_cutoff = self.controller_cfg['squeeze_no_gravity']['near_rigid_object_F_des']
-
-            if self.f_moving_average[-1] > f_cutoff or self.squeeze_no_gravity_contact_fails > 5:
-                if lost_contact:
-                    print("Lost contact during squeezing without gravity")
-                    self.squeeze_no_gravity_lost_contact = True
-
-                # Select self.num_dp points from each running list
-                total_dp = len(self.running_stresses)
-                if total_dp > 0:
-                    self.running_stresses, self.running_positions = np.asarray(
-                        self.running_stresses), np.asarray(self.running_positions)
-                    self.running_forces_on_nodes = np.asarray(self.running_forces_on_nodes)
-                    self.running_right_node_contacts = np.asarray(self.running_right_node_contacts)
-                    self.running_left_node_contacts = np.asarray(self.running_left_node_contacts)
-                    self.running_gripper_positions = np.asarray(self.running_gripper_positions)
-
-                    idx = np.round(np.linspace(0, total_dp - 1, self.num_dp)).astype(int)
-                    self.stacked_stresses = self.running_stresses[idx, :]
-                    self.stacked_positions = self.running_positions[idx, :, :]
-                    self.stacked_right_node_contacts = self.running_right_node_contacts[idx, :, :]
-                    self.stacked_left_node_contacts = self.running_left_node_contacts[idx, :, :]
-                    self.stacked_gripper_positions = self.running_gripper_positions[idx, :]
-                    self.stacked_forces_on_nodes = self.running_forces_on_nodes[idx, :]
-
-                    self.running_l_gripper_contacts = np.asarray(
-                        self.running_l_gripper_contacts)
-                    self.running_r_gripper_contacts = np.asarray(
-                        self.running_r_gripper_contacts)
-                    self.stacked_left_gripper_contact_points = self.running_l_gripper_contacts[
-                        idx, :, :]
-                    self.stacked_right_gripper_contact_points = self.running_r_gripper_contacts[
-                        idx, :, :]
-
-                    self.running_forces = np.asarray(self.running_forces)
-                    self.stacked_forces = self.running_forces[idx]
-
-                self.squeeze_no_gravity_max_force = self.f_moving_average[-1]
-                print(
-                    self.env_id,
-                    "Squeezed to force with max force",
-                    self.squeeze_no_gravity_max_force)
-                self.state = "done"
-
-        ############################################################################
-        # SQUEEZE STATE: Fingers squeeze until desired force is applied
-        ############################################################################
-        if self.state == "squeeze":
-            self.squeeze_counter += 1
-
-            if self.squeeze_counter > 300:
-                self.squeeze_intensity += 1
-                self.squeeze_counter = 0
-
-            # Torque controller to achieved desired squeezing force
-            F_des = np.array(
-                [self.desired_force / 2.0, self.desired_force / 2.0])
-
-            torque_des_force, F_curr_mag, F_err = self.get_force_based_torque(
-                F_des, F_curr)
-            self.torque_des[-2:] = torque_des_force
-            self.f_errs = np.hstack((self.f_errs[1:], F_err))
-
-            # Increase squeezing force to counteract rotational slip
-            if self.mode == "reorient" and np.all(np.abs(self.f_errs) < 0.3 * self.desired_force) \
-                    and not self.squeezed_until_force and not self.inferred_rot_force \
-                    and self.squeeze_counter > 30:
-                req_rot_force = self.infer_rot_force(F_curr)
-                if req_rot_force > self.desired_force:
-                    print("Change desired force from %s to %s" %
-                          (self.desired_force, req_rot_force))
-                    self.desired_force = req_rot_force
-                self.corrected_desired_force = self.desired_force
-                self.inferred_rot_force = True
-
-            # DETECT FAILURE CASES DURING SQUEEZING
-
-            # 1. Detect whether squeezing forces too high, try again
-            force_too_high = False
-            if np.log10(self.youngs) > 9 and f_avg_of_filter > 50:
-                force_too_high = True
-            elif np.log10(self.youngs) <= 9 and (f_avg_of_filter > 4 * self.desired_force) \
-                    and f_avg_of_filter > 10:
-                force_too_high = True
-            if force_too_high:
-                print("Squeezing force too high, reset")
-                self.squeezing_close_fails += 1
-                if self.squeezing_close_fails > 4:
-                    self.state = "done"
-                else:
-                    self.reset_saved_state()
-
-            # 2. Detect whether contact has been lost for a while
-            if np.all(particles_contacting_gripper == 0.0):
-                self.squeeze_lost_contact_counter += 1
-            else:
-                self.squeeze_lost_contact_counter = 0
-
-            if self.squeeze_lost_contact_counter > 100:
-                print("Lost contact during squeezing, reset")
-                self.squeezing_close_fails += 1
-                self.squeeze_lost_contact_counter = 0
-                if self.squeezing_close_fails > 4:
-                    self.state = "done"
-                else:
-                    self.reset_saved_state()
-
-            # 3. Detect whether object is no longer between grippers
-            if self.franka_dof_states['pos'][-3:][
-                    1] < 0.0001 and self.franka_dof_states['pos'][-3:][
-                        2] < 0.0001:
-                print("Can't close that tightly during squeezing, reset")
-                self.squeezing_close_fails += 1
-                self.squeezing_no_grasp += 1
-                if self.squeezing_close_fails > 4 or self.squeezing_no_grasp > 2:
-                    self.state = "done"
-                else:
-                    self.reset_saved_state()
-
-            # 4. Detect whether grippers have exceeded joint limits
-            # (occurs when there are spikes in force readings-> spikes in torque responses)
-            if self.franka_dof_states['pos'][-3:][
-                    1] > 0.04 or self.franka_dof_states['pos'][-3:][2] > 0.04:
-                print(self.env_id, "Grippers exceeded joint limits, reset")
-                self.squeezing_close_fails += 1
-                if self.squeezing_close_fails > 4:
-                    self.state = "done"
-                else:
-                    self.reset_saved_state()
-
-            ############################################################
-            # DETECT STATE TRANSITION WHEN SQUEEZING FORCES ARE MET
-            ############################################################
-            if self.inferred_rot_force:
-                self.inferred_rot_force_counter += 1
-            squeeze_guard = (self.mode != 'reorient') or (
-                self.inferred_rot_force_counter > 30)
-
-            # If desired squeezing forces is met
-            if np.all(
-                    np.abs(self.f_errs) < 0.05 * self.desired_force
-            ) and not self.squeezed_until_force and squeeze_guard and np.all(
-                    particles_contacting_gripper > 0):
-
-                if self.mode == "reorient":
-                    assert (self.inferred_rot_force)
-                self.squeezed_until_force = True
-
-                # Record measurements once force is reached
-                self.positions_at_force = np.copy(
-                    self.particle_state_tensor.numpy()
-                    [self.env_id * self.state_tensor_length:(self.env_id + 1)
-                     * self.state_tensor_length, :])[:, :3]
-                self.gripper_force_at_force = np.sum(F_curr)
-                self.gripper_distance_at_force = np.sum(
-                    self.grippers_pre_squeeze) - curr_separation
-                self.get_contact_geometry_features()
-                stresses_at_force, self.se_at_force, _, _ = tet_based_metrics.get_tet_based_metrics(
-                    self.gym_handle, self.sim_handle, self.env_handles,
-                    self.env_id, self.particle_state_tensor, self.youngs)
-                self.stresses_at_force = stresses_at_force[self.env_id]
-
-                self.f_errs = np.ones(10)
-                curr_joint_positions = self.gym_handle.get_actor_dof_states(
-                    self.env_handle, self.platform_handle, gymapi.STATE_ALL)
-
-                # Record location of gripper fingers
-                mid_fk_map = panda_fk.get_fk(self.franka_dof_states['pos'],
-                                             self.hand_origin,
-                                             mode="mid")
-                self.mid_finger_position_transformed = mid_fk_map.dot(
-                    self.mid_finger_position)[:3]
-
-                print("Platform lower")
-                self.state = "hang"
-
-        if self.state == "hang":
-            curr_gripper_width = np.sum(self.franka_dof_states['pos'][-2:])
-            if self.squeeze_min_gripper_width == 0.0:
-                self.squeeze_min_gripper_width = curr_gripper_width
-            else:
-                if curr_gripper_width < self.squeeze_min_gripper_width:
-                    self.squeeze_min_gripper_width = curr_gripper_width
-
-            self.vel_des = np.zeros(self.controller_cfg['franka']['num_joints'])
-            self.hang_separations.append(curr_separation)
-
-            # Add PID controller to achieve desired force
-            F_des = np.array(
-                [self.desired_force / 2.0, self.desired_force / 2.0])
-            torque_des_force, F_curr_mag, F_err = self.get_force_based_torque(
-                F_des, F_curr)
-            self.torque_des[-2:] = torque_des_force
-
-            self.f_errs = np.hstack((self.f_errs[1:], F_err))
-
-            curr_joint_positions = self.gym_handle.get_actor_dof_states(
-                self.env_handle, self.platform_handle, gymapi.STATE_ALL)
-
-            object_on_platform = self.object_contacting_platform()
-
-            if np.all(np.abs(self.f_errs[-10:]) < 0.05
-                      * self.desired_force) or np.all(self.f_errs[-10:] < 0.0):
-                self.gym_handle.set_actor_dof_velocity_targets(
-                    self.env_handle, self.platform_handle, [-0.08])
-            else:
-                self.gym_handle.set_actor_dof_velocity_targets(
-                    self.env_handle, self.platform_handle, [0.0])
-
-            if not object_on_platform:
-                self.hang_counter += 1
-                curr_stresses = tet_based_metrics.get_stresses_only(
-                    self.gym_handle, self.sim_handle, self.env_handles,
-                    self.env_id, self.particle_state_tensor)[self.env_id]
-                self.hang_stresses.append(curr_stresses)
-
-            if not object_on_platform and self.hang_counter > 50:
-                self.pickup_success = True
-                # Save current hanging mesh
-                self.positions_under_gravity = np.copy(
-                    self.particle_state_tensor.numpy()
-                    [self.env_id * self.state_tensor_length:(self.env_id + 1)
-                        * self.state_tensor_length, :][:, :3])
-
-                # Get strain energies and stresses
-                _, self.se_under_gravity, _, _ = tet_based_metrics.get_tet_based_metrics(
-                    self.gym_handle, self.sim_handle, self.env_handles,
-                    self.env_id, self.particle_state_tensor, self.youngs)
-                self.stresses_under_gravity = np.mean(self.hang_stresses,
-                                                      axis=0)
-
-                # Get gripper force
-                self.gripper_force_under_gravity = np.sum(F_curr)
-                print(self.env_id, "Force under gravity",
-                      self.gripper_force_under_gravity)
-
-                # Get indices of nodes contacting each gripper
-                left_indices, right_indices, _ = self.get_node_indices_contacting_fingers()
-                self.left_gripper_node_contacts[left_indices] = 1
-                self.right_gripper_node_contacts[right_indices] = 1
-
-                # Move the platform far away
-                curr_joint_positions['pos'][0] = -0.4
-                self.gym_handle.set_actor_dof_states(self.env_handle,
-                                                     self.platform_handle,
-                                                     curr_joint_positions,
-                                                     gymapi.STATE_ALL)
-
-                # Freeze gripper joints on both sides
-                self.lock_maximum_finger_positions(1e-6)
-                self.lock_minimum_finger_positions(1e-6)
-
-                self.pickup_success = True
-                if self.mode == "pickup":
-                    self.state = "done"
-                else:
-                    self.state = self.mode
-                print(self.env_id, "Pickup success:", self.pickup_success)
-
-                # Set the desired squeezing gripper width
-                curr_gripper_positions = np.copy(
-                    self.franka_dof_states['pos'][-2:])
-                des_gripper_width = np.mean(self.hang_separations[-30:])
-                self.gripper_positions_under_gravity = np.copy(
-                    self.franka_dof_states['pos'][-2:]) - 0.5 * (
-                        np.sum(curr_gripper_positions) - des_gripper_width)
-
-            elif (curr_joint_positions['pos'][0] <= -0.2
-                  and object_on_platform) or np.all(
-                      particles_contacting_gripper == 0.0):
-                self.pickup_success = False
-                print(self.env_id, "Pickup success:", self.pickup_success)
-                self.state = "done"
-
-        if self.state == 'reorient':
-
-            # Components of each revolute joint in rotation direction
-            reorient_ang_vel = self.controller_cfg['reorient']['ang_vel']
-
-            self.reorient_counter += 1
-            angle_covered = self.sim_params.dt * self.reorient_counter * reorient_ang_vel
-
-            # Use Jacobian to rotate about centroid
-            J = panda_fk.jacobian(self.franka_dof_states['pos'], self.hand_origin)
-            d = self.object_centroid
-            v = np.cross(d, self.direction)
-            V_st = np.concatenate((v, self.direction))
-            joint_vels = np.linalg.inv(J) @ V_st
-            self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-            self.vel_des[:6] = reorient_ang_vel * joint_vels
-            self.vel_des[-2:] = np.array([0.0, 0.0])
-
-            increments = np.linspace(np.pi / 4, np.pi, 4)
-            for ind, ang in enumerate(increments):
-                if angle_covered >= ang and np.all(
-                        self.reorientation_meshes[ind]) == 0.0:
-                    print(self.env_id, "Reorient progress: %s/%s" % (ind + 1, len(increments)))
-                    self.reorientation_meshes[ind] = np.copy(
-                        self.particle_state_tensor.numpy()
-                        [self.env_id
-                         * self.state_tensor_length:(self.env_id + 1)
-                         * self.state_tensor_length, :][:, :3])
-
-                    self.reorientation_stresses[ind] = self.stress_moving_average[-1]
-
-                    if ind >= len(increments) - 1:
-                        self.state = "done"
-
-            # If one side loses contact, end simulation
-            if np.all(particles_contacting_gripper == 0.0):
-                print(self.env_id, "Lost contact during reorient",
-                      particles_contacting_gripper)
-                self.state = "done"
-
-        if self.state == "lin_acc":
-            lin_acc_direction = self.direction
-
-            self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-            max_lin_acc_acc = self.controller_cfg['lin_acc']['max_acc']
-            Dt = self.sim_params.dt * self.lin_acc_counter
-            jerk = self.controller_cfg['lin_acc']['jerk']
-            a = min(max_lin_acc_acc, jerk * Dt)
-            self.lin_acc_vel += a * self.sim_params.dt
-            self.lin_acc_counter += 1
-
-            self.vel_des[:3] = self.lin_acc_vel * lin_acc_direction
-
-            if a >= max_lin_acc_acc:
-                self.lin_acc_fail_acc = max_lin_acc_acc
-                print("Max acceleration exceeded")
-                self.state = "done"
-
-            curr_contacts = particles_contacting_gripper
-
-            if np.any(curr_contacts == 0):
-                self.lin_acc_fail_acc = a
-                print("Max acceleration reached", self.lin_acc_fail_acc)
-                self.state = "done"
-
-        if self.state == "ang_acc":
-
-            # Move to the location for revolution
-            curr_location = self.franka_dof_states['pos'][10:13]
-            travel_location = np.array([0, 0, -self.cfg['franka']['gripper_tip_z_offset']])
-
-            if not self.reached_ang_acc_location:
-                self.ang_acc_travel_counter += 1
-                Dt = self.sim_params.dt * self.ang_acc_travel_counter
-                travel_location = np.array([0, 0, -self.cfg['franka']['gripper_tip_z_offset']])
-
-                travel_acc = self.controller_cfg['ang_acc']['travel_acc']
-                travel_offset = curr_location[-1] - travel_location[-1]
-                if (travel_offset) > (self.cfg['franka']['gripper_tip_z_offset'] / 2.):
-                    self.travel_speed += travel_acc * self.sim_params.dt
-                else:
-                    travel_acc = -travel_acc
-                    self.travel_speed += travel_acc * self.sim_params.dt
-                self.travel_speed = min(self.travel_speed, self.controller_cfg['ang_acc']['max_travel_speed'])
-                self.travel_speed = max(self.travel_speed, self.controller_cfg['ang_acc']['min_travel_speed'])
-
-                travel_vel = self.travel_speed * travel_location / np.linalg.norm(
-                    travel_location)
-
-                self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-                self.vel_des[10:13] = travel_vel
-                self.vel_des = np.asarray(self.vel_des, dtype=np.float32)
-                self.gym_handle.set_actor_dof_velocity_targets(
-                    self.env_handle, self.franka_handle, self.vel_des)
-
-            if np.linalg.norm(travel_location - curr_location
-                              ) < 0.01 and not self.reached_ang_acc_location:
-                self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-                self.reached_ang_acc_location = True
-
-                # Lock locations of sliding joints
-                dof_props = self.gym_handle.get_actor_dof_properties(
-                    self.env_handle, self.franka_handle)
-                dof_props['driveMode'][10] = gymapi.DOF_MODE_POS
-                dof_props['driveMode'][11] = gymapi.DOF_MODE_POS
-                dof_props['driveMode'][12] = gymapi.DOF_MODE_POS
-                dof_props['driveMode'][13] = gymapi.DOF_MODE_POS
-                dof_props['driveMode'][-2] = gymapi.DOF_MODE_POS
-                dof_props['driveMode'][-1] = gymapi.DOF_MODE_POS
-                self.gym_handle.set_actor_dof_properties(
-                    self.env_handle, self.franka_handle, dof_props)
-
-                self.lock_maximum_finger_positions(1e-6)
-                self.lock_minimum_finger_positions(1e-6)
-
-                self.pos_des = np.zeros(self.cfg['franka']['num_joints'])
-                self.pos_des[12] = self.franka_dof_states['pos'][12]
-                self.pos_des[-2] = self.franka_dof_states['pos'][-2]
-                self.pos_des[-1] = self.franka_dof_states['pos'][-1]
-                self.pos_des = np.asarray(self.pos_des, dtype=np.float32)
-                self.gym_handle.set_actor_dof_position_targets(
-                    self.env_handle, self.franka_handle, self.pos_des)
-
-            if self.reached_ang_acc_location:
-                self.ang_acc_counter += 1
-                max_rot_acc = self.controller_cfg['ang_acc']['max_acc']
-                Dt = self.sim_params.dt * self.ang_acc_counter
-                jerk = self.controller_cfg['ang_acc']['jerk']
-                a = min(max_rot_acc, jerk * Dt)
-
-                self.ang_acc_vel += a * self.sim_params.dt
-                self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
-                self.vel_des[6] = self.ang_acc_vel
-                self.vel_des = np.asarray(self.vel_des, dtype=np.float32)
-                self.gym_handle.set_actor_dof_velocity_targets(
-                    self.env_handle, self.franka_handle, self.vel_des)
-                if a >= max_rot_acc:
-                    self.ang_acc_fail_acc = max_rot_acc
-                    print("Max acceleration exceeded")
-
-                    self.state = "done"
-
-                curr_contacts = particles_contacting_gripper
-
-                if np.any(curr_contacts == 0):
-                    print("Lost contact")
-                    self.ang_acc_fail_acc = a
-                    print("Max acceleration reached", self.ang_acc_fail_acc)
-                    self.state = "done"
+        # skip other control/state types
 
         if self.state == "done":
             self.vel_des = np.zeros(self.cfg['franka']['num_joints'])
@@ -1604,3 +1100,4 @@ class PandaFsm:
                                                  self.franka_handle, dof_props)
 
         return
+

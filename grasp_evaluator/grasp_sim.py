@@ -200,11 +200,16 @@ class GraspSim:
         # sim_params.up_axis = gymapi.UP_AXIS_Z
         sim_params.gravity = gymapi.Vec3(0.0, -9.8, 0.0)
 
+        # set PhysX-specific parameters
+        sim_params.physx.use_gpu = True
         sim_params.physx.solver_type = 1
-        sim_params.physx.num_position_iterations = 6
+        sim_params.physx.num_position_iterations = 8
+        sim_params.physx.contact_offset = 0.01
+        sim_params.physx.rest_offset = 0.0
+
+        sim_params.physx.solver_type = 1
         sim_params.physx.num_velocity_iterations = 0
         # sim_params.physx.use_gpu = True
-        sim_params.physx.use_gpu = False
 
         # sim_params.use_gpu_pipeline = True
         sim_params.use_gpu_pipeline = False
@@ -289,7 +294,7 @@ class GraspSim:
                                                        asset_options)
 
         asset_options.fix_base_link = True
-        asset_options.min_particle_mass = 1e-20
+        # asset_options.min_particle_mass = 1e-20
         self.asset_handle_object = self.gym.load_asset(self.sim, asset_root, asset_file_object,
                                                        asset_options)
         rs_props = self.gym.get_asset_rigid_shape_properties(self.asset_handle_object)
@@ -373,7 +378,7 @@ class GraspSim:
         """Create environments, Franka actor, and object actor."""
         self.env_handles = []
         self.franka_handles = []
-        object_handles = []
+        self.object_handles = []
         self.platform_handles = []
         self.hand_origins = []
 
@@ -476,7 +481,7 @@ class GraspSim:
                                                   f"object_{i}", collision_group,
                                                   collision_filter)
             self.gym.set_actor_scale(env_handle, object_handle, self.object_scale)
-            object_handles.append(object_handle)
+            self.object_handles.append(object_handle)
 
             # Create platform
             height_of_platform = 0.005
@@ -525,6 +530,7 @@ class GraspSim:
                                           sim_handle=self.sim,
                                           env_handles=self.env_handles,
                                           franka_handle=self.franka_handles[i],
+                                          object_handle=self.object_handles[i],
                                           platform_handle=self.platform_handles[i],
                                           object_cof=self.friction,
                                           grasp_transform=grasp_transform,
@@ -564,12 +570,12 @@ class GraspSim:
                                                    left_finger_transform.p.y,
                                                    left_finger_transform.p.z])
                 print('left finger position', fingertip_pos)
-                panda_fsms[i].update_previous_particle_state_tensor()
 
             all_done = all(panda_fsms[i].state == 'done'
                            for i in range(len(self.env_handles)))
 
-            self.gym.refresh_particle_state_tensor(self.sim)
+            # self.gym.refresh_particle_state_tensor(self.sim)
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
 
             for i in range(len(self.env_handles)):
                 if panda_fsms[i].state != "done":
